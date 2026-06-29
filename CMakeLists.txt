@@ -84,6 +84,11 @@ add_library(md4x-markdown STATIC src/renderers/md4x-markdown.c)
 md4x_configure(md4x-markdown)
 target_link_libraries(md4x-markdown PUBLIC md4x)
 
+# Streaming (push) front-end for the ANSI renderer.
+add_library(md4x-stream STATIC src/renderers/md4x-stream.c)
+md4x_configure(md4x-stream)
+target_link_libraries(md4x-stream PUBLIC md4x-ansi)
+
 # Heal utility (standalone, no parser dependency).
 add_library(md4x-heal STATIC src/renderers/md4x-heal.c)
 md4x_configure(md4x-heal)
@@ -102,6 +107,7 @@ target_link_libraries(md4x-cli PRIVATE
     md4x-meta
     md4x-text
     md4x-markdown
+    md4x-stream
     md4x-heal
     ${MD4X_FYAML})
 
@@ -135,6 +141,13 @@ if(MD4X_BUILD_TESTS)
             WORKING_DIRECTORY "${MD4X_TEST_DIR}"
             COMMAND ${PYTHON3_EXECUTABLE} pathological-tests.py
                     -p "$<TARGET_FILE:md4x-cli>")
+
+        # Streaming (push) mode: streamed output must equal one-shot output.
+        add_test(
+            NAME stream
+            WORKING_DIRECTORY "${MD4X_TEST_DIR}"
+            COMMAND ${PYTHON3_EXECUTABLE} stream-test.py
+                    -p "$<TARGET_FILE:md4x-cli>")
     else()
         message(WARNING "python3 not found; md4x test suites will not be registered with ctest")
     endif()
@@ -143,7 +156,7 @@ endif()
 # --- Install ---
 
 install(TARGETS
-    md4x md4x-html md4x-ast md4x-ansi md4x-meta md4x-text md4x-markdown md4x-heal
+    md4x md4x-html md4x-ast md4x-ansi md4x-meta md4x-text md4x-markdown md4x-stream md4x-heal
     ARCHIVE DESTINATION lib)
 install(TARGETS md4x-cli RUNTIME DESTINATION bin)
 install(FILES
@@ -154,5 +167,6 @@ install(FILES
     src/renderers/md4x-meta.h
     src/renderers/md4x-text.h
     src/renderers/md4x-markdown.h
+    src/renderers/md4x-stream.h
     src/renderers/md4x-heal.h
     DESTINATION include)

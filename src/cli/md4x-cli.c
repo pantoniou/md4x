@@ -34,6 +34,7 @@
 #include "md4x-text.h"
 #include "md4x-markdown.h"
 #include "md4x-heal.h"
+#include "md4x-stream.h"
 #include "cmdline.h"
 
 #ifdef _WIN32
@@ -77,6 +78,10 @@ static int want_replay_fuzz = 0;
 typedef enum { COLOR_AUTO, COLOR_ON, COLOR_OFF } ColorMode;
 static ColorMode color_mode = COLOR_AUTO;
 static int ansi_width = MD_ANSI_WIDTH_AUTO; /* >0 fixed, 0 inf, <0 auto */
+
+/* Streaming (push) mode for ANSI output. */
+static int want_stream = 0;
+static int stream_chunk = 0;    /* push chunk size; 0 => default (undocumented override) */
 
 static const char* html_title = NULL;
 static const char* css_path = NULL;
@@ -251,6 +256,44 @@ process_file(const char* in_path, FILE* in, FILE* out)
             if(!use_color)
                 a_flags |= MD_ANSI_FLAG_NO_COLOR;
 
+            if(want_stream) {
+                /* Push the input through the streaming context in chunks,
+                 * collecting committed output, then the final remainder. */
+                MD4X_STREAM_OPTS opts;
+                MD4X_STREAM* s;
+                const char* o;
+                size_t olen, off;
+                size_t chunk = (stream_chunk > 0) ? (size_t) stream_chunk : 16;
+
+                memset(&opts, 0, sizeof(opts));
+                opts.parser_flags = p_flags;
+                opts.renderer_flags = a_flags & ~(unsigned) MD_ANSI_FLAG_DEBUG;
+                opts.width = ansi_width;
+                opts.heal = want_heal ? 1 : 0;
+
+                s = md4x_stream_create(&opts);
+                if(s == NULL) { ret = -1; break; }
+
+                ret = 0;
+                for(off = 0; off < buf_in.size; off += chunk) {
+                    size_t clen = buf_in.size - off;
+                    if(clen > chunk) clen = chunk;
+                    if(md4x_stream_push(s, buf_in.data + off, clen, &o, &olen) != 0) {
+                        ret = -1;
+                        break;
+                    }
+                    if(olen > 0) membuf_append(&buf_out, o, (MD_SIZE) olen);
+                }
+                if(ret == 0) {
+                    if(md4x_stream_finish(s, &o, &olen) != 0)
+                        ret = -1;
+                    else if(olen > 0)
+                        membuf_append(&buf_out, o, (MD_SIZE) olen);
+                }
+                md4x_stream_destroy(s);
+                break;
+            }
+
             ret = md_ansi_ex(buf_in.data, (MD_SIZE)buf_in.size, process_output,
                         (void*) &buf_out, p_flags, a_flags, ansi_width);
             break;
@@ -323,6 +366,10 @@ static const CMDLINE_OPTION cmdline_options[] = {
 
     {  0,  "color",                         '5', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "width",                         '6', CMDLINE_OPTFLAG_REQUIREDARG },
+    {  0,  "stream",                        '7', 0 },
+
+    /* Undocumented: override the streaming push chunk size (for tests). */
+    {  0,  "stream-chunk",                  '8', CMDLINE_OPTFLAG_REQUIREDARG },
 
     {  0,  "html-title",                    '1', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "html-css",                      '2', CMDLINE_OPTFLAG_REQUIREDARG },
@@ -351,6 +398,7 @@ usage(void)
         "ANSI output options (--format=ansi):\n"
         "      --color=MODE     Color output: auto (default), on, off\n"
         "      --width=WIDTH    Table width: auto (default), inf, or a column count\n"
+        "      --stream         Render incrementally (push mode); emits stable output as it arrives\n"
         "\n"
         "HTML output options:\n"
         "  -f, --full-html      Generate full HTML document, including header\n"
@@ -421,6 +469,15 @@ cmdline_callback(int opt, char const* value, void* data)
                 color_mode = COLOR_OFF;
             else {
                 fprintf(stderr, "Invalid --color value: %s (use auto, on, or off)\n", value);
+                exit(1);
+            }
+            break;
+
+        case '7':   want_stream = 1; break;
+        case '8':   /* --stream-chunk=<n> (undocumented) */
+            stream_chunk = atoi(value);
+            if(stream_chunk < 1) {
+                fprintf(stderr, "Invalid --stream-chunk value: %s\n", value);
                 exit(1);
             }
             break;

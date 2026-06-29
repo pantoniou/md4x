@@ -80,6 +80,12 @@ extern "C"
                    void *userdata, unsigned parser_flags, unsigned renderer_flags,
                    int width);
 
+    /* Resolve the auto layout width: from $COLUMNS, then the terminal
+     * (TIOCGWINSZ), else 80. This is what MD_ANSI_WIDTH_AUTO uses internally;
+     * exposed so callers (e.g. the streaming front-end) can pin a concrete
+     * width once instead of re-detecting it per render. */
+    int md_ansi_detect_width(void);
+
 #ifdef __cplusplus
 } /* extern "C" { */
 #endif

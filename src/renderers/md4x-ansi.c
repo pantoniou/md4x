@@ -857,6 +857,12 @@ table_term_width(void)
     return 80;
 }
 
+int
+md_ansi_detect_width(void)
+{
+    return table_term_width();
+}
+
 static void
 table_cell_append(MD_ANSI_TABLE* t, const MD_CHAR* text, MD_SIZE size)
 {
