@@ -154,6 +154,102 @@ process_output(const MD_CHAR* text, MD_SIZE size, void* userdata)
     membuf_append((struct membuffer*) userdata, text, size);
 }
 
+static size_t
+count_nl(const char* s, size_t n)
+{
+    size_t i, c = 0;
+    for(i = 0; i < n; i++)
+        if(s[i] == '\n') c++;
+    return c;
+}
+
+/* Live progressive ANSI rendering. Reads input incrementally and drives
+ * md4x_stream_render(). When `out` is a terminal, each update is applied with
+ * cursor control: move up `backtrack` lines, clear to end of screen, print the
+ * new content. The on-screen active row count is tracked so we never move up
+ * past it. When `out` is not a terminal, the updates are applied to a virtual
+ * screen and the final result is written (deterministic; matches one-shot). */
+static int
+process_ansi_progressive(FILE* in, FILE* out)
+{
+    MD4X_STREAM_OPTS opts;
+    MD4X_STREAM* s;
+    struct membuffer scr = {0};
+    char rbuf[8192];
+    size_t rd, want;
+    int tty = md4x_isatty(md4x_fileno(out));
+    int use_color;
+    unsigned a_flags = 0;
+    size_t active_rows = 0;
+    int ret = 0;
+
+#ifndef MD4X_USE_ASCII
+    a_flags |= MD_ANSI_FLAG_SKIP_UTF8_BOM;
+#endif
+    if(color_mode == COLOR_ON)
+        use_color = 1;
+    else if(color_mode == COLOR_OFF)
+        use_color = 0;
+    else
+        use_color = tty;
+    if(!use_color)
+        a_flags |= MD_ANSI_FLAG_NO_COLOR;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.parser_flags = parser_flags;
+    opts.renderer_flags = a_flags;
+    opts.width = ansi_width;
+    opts.heal = want_heal ? 1 : 0;
+
+    s = md4x_stream_create(&opts);
+    if(s == NULL)
+        return -1;
+    if(!tty)
+        membuf_init(&scr, 8192);
+
+    /* Read size: honor --stream-chunk (for tests), else a full buffer. */
+    want = (stream_chunk > 0 && (size_t) stream_chunk < sizeof(rbuf))
+         ? (size_t) stream_chunk : sizeof(rbuf);
+
+    while((rd = fread(rbuf, 1, want, in)) > 0) {
+        MD4X_STREAM_UPDATE upd;
+        if(md4x_stream_render(s, rbuf, rd, &upd) != 0) { ret = -1; break; }
+
+        if(tty) {
+            if(upd.backtrack > 0) {
+                size_t b = (upd.backtrack > active_rows) ? active_rows : upd.backtrack;
+                char esc[32];
+                int m = snprintf(esc, sizeof(esc), "\033[%uA\r\033[J", (unsigned) b);
+                fwrite(esc, 1, (size_t) m, out);
+                active_rows -= b;
+            }
+            if(upd.content_len > 0)
+                fwrite(upd.content, 1, upd.content_len, out);
+            fflush(out);
+            active_rows += count_nl(upd.content, upd.content_len);
+            active_rows = (upd.freeze >= active_rows) ? 0 : active_rows - upd.freeze;
+        } else {
+            /* Reconstruct the virtual screen: drop `backtrack` trailing lines,
+             * then append the new content. */
+            size_t pos = scr.size, k;
+            for(k = 0; k < upd.backtrack && pos > 0; k++) {
+                pos--;
+                while(pos > 0 && scr.data[pos - 1] != '\n') pos--;
+            }
+            scr.size = pos;
+            if(upd.content_len > 0)
+                membuf_append(&scr, upd.content, (MD_SIZE) upd.content_len);
+        }
+    }
+
+    if(!tty && ret == 0)
+        fwrite(scr.data, 1, scr.size, out);
+
+    md4x_stream_destroy(s);
+    membuf_fini(&scr);
+    return ret;
+}
+
 static int
 process_file(const char* in_path, FILE* in, FILE* out)
 {
@@ -164,6 +260,11 @@ process_file(const char* in_path, FILE* in, FILE* out)
     clock_t t0, t1;
     unsigned p_flags = parser_flags;
     unsigned r_flags = renderer_flags;
+
+    /* Live progressive ANSI mode reads input incrementally (it does not need
+     * the whole document up front), so handle it before buffering input. */
+    if(output_format == FORMAT_ANSI && want_stream_progressive)
+        return process_ansi_progressive(in, out);
 
     membuf_init(&buf_in, 32 * 1024);
 
@@ -276,34 +377,6 @@ process_file(const char* in_path, FILE* in, FILE* out)
                 if(s == NULL) { ret = -1; break; }
 
                 ret = 0;
-                if(want_stream_progressive) {
-                    /* Drive md4x_stream_render() and reconstruct the screen by
-                     * applying each {backtrack, content} update; print the final
-                     * screen (must match the one-shot render). */
-                    for(off = 0; off < buf_in.size; off += chunk) {
-                        MD4X_STREAM_UPDATE upd;
-                        size_t clen = buf_in.size - off;
-                        if(clen > chunk) clen = chunk;
-                        if(md4x_stream_render(s, buf_in.data + off, clen, &upd) != 0) {
-                            ret = -1;
-                            break;
-                        }
-                        /* Erase upd.backtrack trailing lines from buf_out. */
-                        {
-                            size_t pos = buf_out.size, k;
-                            for(k = 0; k < upd.backtrack && pos > 0; k++) {
-                                pos--;
-                                while(pos > 0 && buf_out.data[pos - 1] != '\n') pos--;
-                            }
-                            buf_out.size = pos;
-                        }
-                        if(upd.content_len > 0)
-                            membuf_append(&buf_out, upd.content, (MD_SIZE) upd.content_len);
-                    }
-                    md4x_stream_destroy(s);
-                    break;
-                }
-
                 for(off = 0; off < buf_in.size; off += chunk) {
                     size_t clen = buf_in.size - off;
                     if(clen > chunk) clen = chunk;
@@ -396,12 +469,10 @@ static const CMDLINE_OPTION cmdline_options[] = {
     {  0,  "color",                         '5', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "width",                         '6', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "stream",                        '7', 0 },
+    {  0,  "stream-progressive",            '9', 0 },
 
     /* Undocumented: override the streaming push chunk size (for tests). */
     {  0,  "stream-chunk",                  '8', CMDLINE_OPTFLAG_REQUIREDARG },
-
-    /* Undocumented: drive md4x_stream_render() and reconstruct the screen. */
-    {  0,  "stream-progressive",            '9', 0 },
 
     {  0,  "html-title",                    '1', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "html-css",                      '2', CMDLINE_OPTFLAG_REQUIREDARG },
@@ -431,6 +502,7 @@ usage(void)
         "      --color=MODE     Color output: auto (default), on, off\n"
         "      --width=WIDTH    Table width: auto (default), inf, or a column count\n"
         "      --stream         Render incrementally (push mode); emits stable output as it arrives\n"
+        "      --stream-progressive  Live progressive render; updates the active region in place on a terminal\n"
         "\n"
         "HTML output options:\n"
         "  -f, --full-html      Generate full HTML document, including header\n"

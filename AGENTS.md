@@ -74,7 +74,8 @@ test/
   coverage.txt         # Code coverage tests
   run-testsuite.py     # Individual test suite runner
   pathological-tests.py # Stress tests for DoS resistance
-  stream-test.py       # Streaming (--stream) vs one-shot equality test
+  stream-test.py       # Streaming (--stream / --stream-progressive) vs one-shot equality test
+  stream-demo.sh       # Animated demo of live progressive rendering
   prog.py              # Program execution wrapper
   normalize.py         # HTML normalization for comparison
   fuzzers/             # LibFuzzer harnesses (html, ast, ansi, text, meta, heal)
@@ -255,10 +256,11 @@ All extensions are enabled by default (`MD_DIALECT_ALL`). No dialect preset flag
 | `--color=MODE`    | Color output: `auto` (default; on only when stdout is a TTY), `on`, `off` |
 | `--width=WIDTH`   | Layout width: `auto` (default; `$COLUMNS`/terminal, else 80), `inf` (unlimited), or a column count |
 | `--stream`        | Render incrementally (push mode); emits stable output as input arrives    |
+| `--stream-progressive` | Live progressive render; updates the active region in place on a terminal |
 
 Terminal-friendly output with ANSI escape codes for colors, bold, italic, underline, and other styling. Tables are laid out glow-style (Unicode box separators, aligned columns), and all text is word-wrapped to the width with a 2-column document margin on each side. `--width=inf` disables wrapping. (Long options require `=`, e.g. `--width=80`.)
 
-`--stream` uses the push/streaming API (`md4x_stream_*`, see [docs/renderers.md](docs/renderers.md)): output is committed up to the last "safe sync point" (a blank line where all block containers are closed) so only the active region is re-rendered. With healing off, the streamed output is byte-identical to a one-shot `--format=ansi` render.
+`--stream` uses the push/streaming API (`md4x_stream_*`, see [docs/renderers.md](docs/renderers.md)): output is committed up to the last "safe sync point" (a blank line where all block containers are closed) so only the active region is re-rendered. With healing off, the streamed output is byte-identical to a one-shot `--format=ansi` render. `--stream-progressive` reads input incrementally and updates the active region in place via cursor control when stdout is a terminal (and writes the final reconstructed screen otherwise). See `test/stream-demo.sh` for a line-by-line animated demo.
 
 **JSON output (`--format=json`):** Produces a Comark AST: `{"nodes":[...],"frontmatter":{...},"meta":{}}`. Each node is either a plain string (text) or a tuple array `[tag, props, ...children]`. Frontmatter YAML is parsed into the top-level `frontmatter` object. HTML comments are represented as `[null, {}, "comment body"]`.
 

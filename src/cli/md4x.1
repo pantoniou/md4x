@@ -138,6 +138,10 @@ Layout width: \fBauto\fR (default; from \fB$COLUMNS\fR or the terminal, else 80)
 .B --stream
 Render incrementally (push mode): output is emitted as input arrives, committed up to the last safe sync point. With healing off, the result is identical to a non-streamed ANSI render.
 .
+.TP
+.B --stream-progressive
+Live progressive render: input is read incrementally and the active region (the part after the last safe sync point) is updated in place. On a terminal, each update moves the cursor up and reprints only the changed lines; when output is not a terminal, the final reconstructed screen is written (identical to a non-streamed render).
+.
 .SH SEE ALSO
 .
 https://github.com/unjs/md4x
