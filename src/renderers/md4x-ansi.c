@@ -104,6 +104,9 @@
 #define TBL_HORIZ           "\xe2\x94\x80"  /* ─ U+2500 */
 #define TBL_CROSS           "\xe2\x94\xbc"  /* ┼ U+253C */
 
+/* Document margin reserved on each side of every line (like glow). */
+#define DOC_MARGIN          2
+
 /* Blockquote bar (UTF-8: vertical bar U+2502) */
 #define QUOTE_BAR           "\xe2\x94\x82"
 
@@ -283,7 +286,8 @@ render_indent_chrome(MD_ANSI* r)
 {
     int i;
     /* Global document left margin, applied to every line (like glow). */
-    RENDER_VERBATIM(r, "  ");
+    for(i = 0; i < DOC_MARGIN; i++)
+        RENDER_VERBATIM(r, " ");
     for(i = 0; i < r->quote_depth; i++) {
         render_ansi(r, ANSI_DIM);
         RENDER_VERBATIM(r, QUOTE_BAR " ");
@@ -334,7 +338,7 @@ render_indent(MD_ANSI* r)
 static void
 flush_wrapped(MD_ANSI* r)
 {
-    int avail = r->wrap_cols - r->indent_w;
+    int avail = r->wrap_cols - r->indent_w - DOC_MARGIN;  /* reserve right margin */
     int n = 0, k;
     TLINE* lines;
 
@@ -1186,7 +1190,7 @@ table_emit(MD_ANSI* r)
     if(r->table_width != MD_ANSI_WIDTH_INF) {
         int wtarget = (r->table_width > 0) ? r->table_width : table_term_width();
         int overhead = 2 + 3 * (n_cols - 1);
-        int content_avail = wtarget - indent_w - overhead;
+        int content_avail = wtarget - indent_w - overhead - DOC_MARGIN; /* right margin */
         if(content_avail < n_cols) content_avail = n_cols;  /* >= 1 col each */
 
         total = 0;
