@@ -11,6 +11,15 @@
 - **CMake build (C only)**: New `CMakeLists.txt` building the parser/renderer static libraries and the `md4x` CLI. It uses `find_package(libfyaml CONFIG REQUIRED)` (direct CMake package dependency, no pkg-config) and does not cover the WASM/NAPI/JS targets.
 - **ctest**: The test suites (`test/*.txt`) and the pathological stress test are registered as ctest tests and are the preferred way to run them: `ctest --test-dir build`.
 
+### ANSI renderer
+
+- **Glow-style table rendering**: Tables are now laid out instead of tab-separated. Columns are sized to content with Unicode box separators (`│ ┼ ─`), a single header separator, per-column alignment (left/center/right), and a 1-space cell padding. Columns expand to fill the target width or shrink (with word-wrapped cells) when too wide. Modeled on the [glow](https://github.com/charmbracelet/glow) / charmbracelet lipgloss table renderer.
+- **Word-wrapping**: All output (headings, paragraphs, blockquotes, list items, and table cells) is word-wrapped to the target width; soft breaks reflow, hard breaks are preserved, and code blocks are left preformatted. `--width=inf` disables wrapping.
+- **Document margins**: A symmetric 2-column document margin is applied to every line (matching glow). Blockquotes render as `  │ ` (no double padding) and nest as `  │ │ `.
+- **Unicode-aware widths**: Cell/line widths use a Markus-Kuhn-style `wcwidth` table — zero-width combining/format marks, East Asian Wide/Fullwidth and most emoji counted as 2 columns, everything else as 1 (Greek stays 1). ANSI escape sequences are skipped when measuring.
+- **CLI options** for `--format=ansi`: `--color=auto|on|off` (auto enables color only when stdout is a TTY) and `--width=auto|inf|<n>` (auto detects from `$COLUMNS`/terminal, `inf`/`0` = unlimited, `<n>` = fixed column count).
+- **New `md_ansi_ex()` API**: like `md_ansi()` but takes an explicit table/wrap width (`MD_ANSI_WIDTH_AUTO`, `MD_ANSI_WIDTH_INF`, or a positive column count). `md_ansi()` is unchanged (auto width).
+
 ### Features
 
 - **Block component title (VitePress-style custom containers)**: Block components now support a title text after the component name: `:::danger STOP`, `:::details Click me`, `:::info My Title {props}`. The title is rendered as a `title` attribute in HTML, a `"title"` prop in JSON AST, and as the display label in ANSI output.
