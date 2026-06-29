@@ -77,18 +77,19 @@ def main():
     # is intentionally NOT required to match a one-shot render byte-for-byte,
     # since md_heal is a whole-document transform.)
     truncated = "a paragraph then some **bold that never closes"
-    healed = run(opts.program, truncated, ["--width=80", "--stream", "--stream-chunk=5", "--heal"])
-    plain = run(opts.program, truncated, ["--width=80", "--stream", "--stream-chunk=5"])
-    if b"**" in healed:
-        failed += 1
-        print("FAIL heal smoke: trailing ** not healed: %r" % healed)
-    else:
-        passed += 1
-    if b"**" not in plain:
-        failed += 1
-        print("FAIL heal smoke: ** unexpectedly removed without --heal: %r" % plain)
-    else:
-        passed += 1
+    for mode in ("--stream", "--stream-progressive"):
+        healed = run(opts.program, truncated, ["--width=80", mode, "--stream-chunk=5", "--heal"])
+        plain = run(opts.program, truncated, ["--width=80", mode, "--stream-chunk=5"])
+        if b"**" in healed:
+            failed += 1
+            print("FAIL heal smoke (%s): trailing ** not healed: %r" % (mode, healed))
+        else:
+            passed += 1
+        if b"**" not in plain:
+            failed += 1
+            print("FAIL heal smoke (%s): ** unexpectedly removed without --heal: %r" % (mode, plain))
+        else:
+            passed += 1
 
     print("%d passed, %d failed" % (passed, failed))
     sys.exit(1 if failed else 0)

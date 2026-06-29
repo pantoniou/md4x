@@ -73,7 +73,9 @@ extern "C"
         unsigned parser_flags;   /* parser flags (0 => MD_DIALECT_ALL) */
         unsigned renderer_flags; /* MD_ANSI_FLAG_* (e.g. NO_COLOR); HEAL is managed internally */
         int width;              /* MD_ANSI_WIDTH_AUTO / MD_ANSI_WIDTH_INF / fixed columns */
-        int heal;               /* non-zero: preview()/finish() close dangling markers */
+        int heal;               /* non-zero: preview()/finish() and the md4x_stream_render()
+                                   display close dangling markers (committed output stays the
+                                   unhealed truth) */
     } MD4X_STREAM_OPTS;
 
     /* Create a streaming context. Pass NULL for defaults (MD_DIALECT_ALL parser
@@ -130,9 +132,11 @@ extern "C"
     } MD4X_STREAM_UPDATE;
 
     /* Append input and produce a progressive update for the active region (the
-     * region after the last safe sync point). The active region is rendered
-     * unhealed, so what is displayed matches the final committed output and a
-     * line only changes when its source does. Returns 0 / -1. */
+     * region after the last safe sync point). The displayed active region is
+     * rendered per opts.heal (healed closes dangling markers in the in-progress
+     * tail); committed/frozen lines always use the unhealed truth and are frozen
+     * only where healing did not change them, so committed output is stable.
+     * Returns 0 / -1. */
     int md4x_stream_render(MD4X_STREAM* s, const char* chunk, size_t len,
                            MD4X_STREAM_UPDATE* upd);
 

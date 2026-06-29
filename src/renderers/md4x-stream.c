@@ -398,18 +398,18 @@ md4x_stream_render(MD4X_STREAM* s, const char* chunk, size_t len,
     if(len > 0 && sbuf_append(&s->accum, chunk, len) != 0)
         return -1;
 
-    /* Render the active region (unhealed: what is shown equals the committed
-     * truth, so a line only changes when its source does) into the scratch
-     * buffer s->out, then compose s->tail = leading inter-block separator (a
-     * blank line, present once anything has been committed above) + that render.
-     * The separator is what joins the active region to the committed output. */
-    if(stream_render(s, &s->out, s->accum.data + s->anchor,
-                     s->accum.size - s->anchor, 0) != 0)
+    /* Render the active region for DISPLAY (healed iff opts.heal, so dangling
+     * markers in the in-progress tail show closed) into s->seg, then compose
+     * s->tail = leading inter-block separator (a blank line, present once
+     * anything has been committed above) + that render. The separator is what
+     * joins the active region to the committed output. */
+    if(stream_render(s, &s->seg, s->accum.data + s->anchor,
+                     s->accum.size - s->anchor, s->heal) != 0)
         return -1;
     sbuf_reset(&s->tail);
     if(s->emitted && sbuf_append(&s->tail, "\n", 1) != 0)
         return -1;
-    if(sbuf_append(&s->tail, s->out.data, s->out.size) != 0)
+    if(sbuf_append(&s->tail, s->seg.data, s->seg.size) != 0)
         return -1;
 
     /* Diff against what is currently displayed: keep the common leading lines,
@@ -419,18 +419,21 @@ md4x_stream_render(MD4X_STREAM* s, const char* chunk, size_t len,
     upd->content = s->tail.data + line_start;
     upd->content_len = s->tail.size - line_start;
 
-    /* Advance the commit anchor to the furthest verified safe sync point; the
-     * lines up to it (including the leading separator) become permanent
-     * (reported via freeze) and drop out of the mutable active region. */
+    /* Advance the commit anchor to the furthest verified safe sync point. The
+     * committed segment uses the UNHEALED render (the truth), and is committed
+     * only when it is a true prefix of the displayed (possibly healed) render —
+     * so a line is frozen only where healing did not change it. The frozen lines
+     * (including the leading separator) become permanent (reported via freeze)
+     * and drop out of the mutable active region. */
     sync = next_sync_offset(s->accum.data, s->accum.size, s->anchor);
     if(sync > s->anchor) {
         size_t sep = s->emitted ? 1 : 0;
-        if(stream_render(s, &s->seg, s->accum.data + s->anchor,
+        if(stream_render(s, &s->out, s->accum.data + s->anchor,
                          sync - s->anchor, 0) != 0)
             return -1;
-        if(s->seg.size <= s->out.size
-           && memcmp(s->seg.data, s->out.data, s->seg.size) == 0) {
-            freeze_bytes = sep + s->seg.size;
+        if(s->out.size <= s->seg.size
+           && memcmp(s->out.data, s->seg.data, s->out.size) == 0) {
+            freeze_bytes = sep + s->out.size;
             upd->freeze = count_lines(s->tail.data, freeze_bytes);
             s->anchor = sync;
             s->emitted = 1;
