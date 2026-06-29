@@ -23,8 +23,18 @@
  * IN THE SOFTWARE.
  */
 
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#if defined(unix) || defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    #if !defined(__wasi__) && !defined(__wasm__)
+        #define MD4X_ANSI_HAVE_IOCTL 1
+        #include <unistd.h>
+        #include <sys/ioctl.h>
+    #endif
+#endif
 
 #include "md4x-ansi.h"
 #include "md4x-props.h"
@@ -85,6 +95,16 @@
                             "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
                             "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
 
+/* Table box-drawing pieces (UTF-8) and ellipsis.
+ * The table layout below is modeled on the glow / charmbracelet lipgloss
+ * table renderer (MIT licensed): content-sized columns, a single header
+ * separator, vertical column separators, per-column alignment, and
+ * fit-to-terminal-width with ellipsis truncation. */
+#define TBL_VERT            "\xe2\x94\x82"  /* │ U+2502 */
+#define TBL_HORIZ           "\xe2\x94\x80"  /* ─ U+2500 */
+#define TBL_CROSS           "\xe2\x94\xbc"  /* ┼ U+253C */
+#define TBL_ELLIPSIS        "\xe2\x80\xa6"  /* … U+2026 */
+
 /* Blockquote bar (UTF-8: vertical bar U+2502) */
 #define QUOTE_BAR           "\xe2\x94\x82"
 
@@ -106,6 +126,35 @@ typedef struct MD_ANSI_CODE_META {
     MD_SIZE prefix_size;
 } MD_ANSI_CODE_META;
 
+/* Buffered table cell/row/table state. Cell content (including ANSI escapes
+ * from inline spans) is captured into per-cell buffers while the table is
+ * parsed, then laid out and emitted when the table block closes. */
+typedef struct MD_ANSI_TCELL {
+    char* buf;
+    MD_SIZE size;
+    MD_SIZE cap;
+} MD_ANSI_TCELL;
+
+typedef struct MD_ANSI_TROW {
+    MD_ANSI_TCELL* cells;
+    int n_cells;
+    int cap_cells;
+    int is_header;
+} MD_ANSI_TROW;
+
+typedef struct MD_ANSI_TABLE {
+    MD_ANSI_TROW* rows;
+    int n_rows;
+    int cap_rows;
+    MD_ALIGN* aligns;       /* per-column alignment */
+    int n_aligns;
+    int cap_aligns;
+    int capturing;          /* currently capturing a cell */
+    int cur_is_header;      /* rows being created belong to the header */
+    MD_ANSI_TCELL* cur;     /* cell currently being captured */
+    int oom;                /* allocation failure flag */
+} MD_ANSI_TABLE;
+
 typedef struct MD_ANSI_tag MD_ANSI;
 struct MD_ANSI_tag {
     void (*process_output)(const MD_CHAR*, MD_SIZE, void*);
@@ -124,6 +173,9 @@ struct MD_ANSI_tag {
     int component_nesting;  /* block component nesting depth */
     int in_comp_frontmatter; /* inside component frontmatter (suppress output) */
 
+    MD_ANSI_TABLE* table;   /* non-NULL while inside a table block */
+    int table_width;        /* >0 fixed, 0 = unlimited, <0 = auto-detect */
+
     /* Code block metadata tracking (only active when MD_ANSI_FLAG_CODE_META is set) */
     MD_SIZE output_offset;
     MD_ANSI_CODE_META* code_blocks;
@@ -136,9 +188,16 @@ struct MD_ANSI_tag {
  ***  ANSI rendering helper functions  ***
  *********************************************/
 
+static void table_cell_append(MD_ANSI_TABLE* t, const MD_CHAR* text, MD_SIZE size);
+
 static inline void
 render_verbatim(MD_ANSI* r, const MD_CHAR* text, MD_SIZE size)
 {
+    /* While capturing a table cell, redirect output into the cell buffer. */
+    if(r->table != NULL && r->table->capturing && r->table->cur != NULL) {
+        table_cell_append(r->table, text, size);
+        return;
+    }
     r->process_output(text, size, r->userdata);
     if(r->flags & MD_ANSI_FLAG_CODE_META)
         r->output_offset += size;
@@ -462,6 +521,498 @@ render_ansi_code_meta_json(MD_ANSI* r)
 }
 
 
+/*****************************************
+ ***  Table layout (glow / lipgloss)   ***
+ *****************************************/
+
+/* Decode one UTF-8 sequence; returns byte length, stores codepoint in *cp. */
+static MD_SIZE
+ansi_utf8_decode(const char* s, MD_SIZE n, unsigned* cp)
+{
+    unsigned char c = (unsigned char) s[0];
+    if(c < 0x80) { *cp = c; return 1; }
+    if((c & 0xe0) == 0xc0 && n >= 2) {
+        *cp = ((c & 0x1f) << 6) | ((unsigned char) s[1] & 0x3f);
+        return 2;
+    }
+    if((c & 0xf0) == 0xe0 && n >= 3) {
+        *cp = ((c & 0x0f) << 12) | (((unsigned char) s[1] & 0x3f) << 6)
+            | ((unsigned char) s[2] & 0x3f);
+        return 3;
+    }
+    if((c & 0xf8) == 0xf0 && n >= 4) {
+        *cp = ((c & 0x07) << 18) | (((unsigned char) s[1] & 0x3f) << 12)
+            | (((unsigned char) s[2] & 0x3f) << 6) | ((unsigned char) s[3] & 0x3f);
+        return 4;
+    }
+    *cp = c;
+    return 1;
+}
+
+/* Sorted [lo,hi] ranges of zero-width codepoints: Unicode general categories
+ * Cf (format), Mn (nonspacing mark) and Me (enclosing mark), plus the C0/C1
+ * control hint. Mirrors the classic Markus Kuhn wcwidth() combining table,
+ * extended for later Unicode. Kept here (rather than a generated table) so the
+ * ANSI renderer has no dependency on md4x.c's Unicode internals. */
+typedef struct { unsigned lo, hi; } CP_RANGE;
+
+static const CP_RANGE zero_width_ranges[] = {
+    {0x0300,0x036f},{0x0483,0x0489},{0x0591,0x05bd},{0x05bf,0x05bf},
+    {0x05c1,0x05c2},{0x05c4,0x05c5},{0x05c7,0x05c7},{0x0610,0x061a},
+    {0x064b,0x065f},{0x0670,0x0670},{0x06d6,0x06dc},{0x06df,0x06e4},
+    {0x06e7,0x06e8},{0x06ea,0x06ed},{0x0711,0x0711},{0x0730,0x074a},
+    {0x07a6,0x07b0},{0x07eb,0x07f3},{0x0816,0x0819},{0x081b,0x0823},
+    {0x0825,0x0827},{0x0829,0x082d},{0x0859,0x085b},{0x08e3,0x0902},
+    {0x093a,0x093a},{0x093c,0x093c},{0x0941,0x0948},{0x094d,0x094d},
+    {0x0951,0x0957},{0x0962,0x0963},{0x0981,0x0981},{0x09bc,0x09bc},
+    {0x09c1,0x09c4},{0x09cd,0x09cd},{0x0a01,0x0a02},{0x0a3c,0x0a3c},
+    {0x0a41,0x0a51},{0x0a70,0x0a71},{0x0a75,0x0a75},{0x0abc,0x0abc},
+    {0x0ac1,0x0acd},{0x0b01,0x0b01},{0x0b3c,0x0b3c},{0x0b3f,0x0b3f},
+    {0x0b41,0x0b56},{0x0b82,0x0b82},{0x0bc0,0x0bc0},{0x0bcd,0x0bcd},
+    {0x0c00,0x0c00},{0x0c3e,0x0c40},{0x0c46,0x0c56},{0x0cbc,0x0cbc},
+    {0x0ccc,0x0ccd},{0x0e31,0x0e31},{0x0e34,0x0e3a},{0x0e47,0x0e4e},
+    {0x0eb1,0x0eb1},{0x0eb4,0x0ebc},{0x0ec8,0x0ecd},{0x0f18,0x0f19},
+    {0x0f35,0x0f35},{0x0f37,0x0f37},{0x0f39,0x0f39},{0x0f71,0x0f7e},
+    {0x0f80,0x0f84},{0x0f86,0x0f87},{0x0f8d,0x0fbc},{0x0fc6,0x0fc6},
+    {0x102d,0x1030},{0x1032,0x1037},{0x1039,0x103a},{0x103d,0x103e},
+    {0x1058,0x1059},{0x105e,0x1060},{0x1071,0x1074},{0x1082,0x1082},
+    {0x1085,0x1086},{0x108d,0x108d},{0x135d,0x135f},{0x1712,0x1714},
+    {0x1732,0x1734},{0x1752,0x1753},{0x1772,0x1773},{0x17b4,0x17b5},
+    {0x17b7,0x17bd},{0x17c6,0x17c6},{0x17c9,0x17d3},{0x17dd,0x17dd},
+    {0x180b,0x180e},{0x1885,0x1886},{0x18a9,0x18a9},{0x1920,0x1922},
+    {0x1927,0x1928},{0x1932,0x1932},{0x1939,0x193b},{0x1a17,0x1a18},
+    {0x1a1b,0x1a1b},{0x1a56,0x1a56},{0x1a58,0x1a60},{0x1a62,0x1a62},
+    {0x1a65,0x1a6c},{0x1a73,0x1a7c},{0x1a7f,0x1a7f},{0x1ab0,0x1aff},
+    {0x1b00,0x1b03},{0x1b34,0x1b34},{0x1b36,0x1b3a},{0x1b3c,0x1b3c},
+    {0x1b42,0x1b42},{0x1b6b,0x1b73},{0x1b80,0x1b81},{0x1ba2,0x1ba5},
+    {0x1ba8,0x1ba9},{0x1bab,0x1bad},{0x1be6,0x1be6},{0x1be8,0x1be9},
+    {0x1bed,0x1bed},{0x1bef,0x1bf1},{0x1c2c,0x1c33},{0x1c36,0x1c37},
+    {0x1cd0,0x1cd2},{0x1cd4,0x1ce0},{0x1ce2,0x1ce8},{0x1ced,0x1ced},
+    {0x1cf4,0x1cf4},{0x1cf8,0x1cf9},{0x1dc0,0x1dff},{0x200b,0x200f},
+    {0x202a,0x202e},{0x2060,0x2064},{0x2066,0x206f},{0x20d0,0x20f0},
+    {0x2cef,0x2cf1},{0x2d7f,0x2d7f},{0x2de0,0x2dff},{0x302a,0x302d},
+    {0x3099,0x309a},{0xa66f,0xa672},{0xa674,0xa67d},{0xa69e,0xa69f},
+    {0xa6f0,0xa6f1},{0xa802,0xa802},{0xa806,0xa806},{0xa80b,0xa80b},
+    {0xa825,0xa826},{0xa8c4,0xa8c5},{0xa8e0,0xa8f1},{0xa926,0xa92d},
+    {0xa947,0xa951},{0xa980,0xa982},{0xa9b3,0xa9b3},{0xa9b6,0xa9b9},
+    {0xa9bc,0xa9bc},{0xa9e5,0xa9e5},{0xaa29,0xaa2e},{0xaa31,0xaa32},
+    {0xaa35,0xaa36},{0xaa43,0xaa43},{0xaa4c,0xaa4c},{0xaa7c,0xaa7c},
+    {0xaab0,0xaab0},{0xaab2,0xaab4},{0xaab7,0xaab8},{0xaabe,0xaabf},
+    {0xaac1,0xaac1},{0xaaec,0xaaed},{0xaaf6,0xaaf6},{0xabe5,0xabe5},
+    {0xabe8,0xabe8},{0xabed,0xabed},{0xfb1e,0xfb1e},{0xfe00,0xfe0f},
+    {0xfe20,0xfe2f},{0xfeff,0xfeff},{0xfff9,0xfffb},{0x101fd,0x101fd},
+    {0x102e0,0x102e0},{0x10376,0x1037a},{0x10a01,0x10a0f},{0x10a38,0x10a3f},
+    {0x11000,0x11002},{0x11038,0x11046},{0x1107f,0x11082},{0x110b3,0x110ba},
+    {0x11100,0x11102},{0x11127,0x1112b},{0x1112d,0x11134},{0x11180,0x11181},
+    {0x111b6,0x111be},{0x1122f,0x11231},{0x11234,0x11237},{0x112df,0x112ea},
+    {0x11300,0x11301},{0x1133c,0x1133c},{0x11340,0x11340},{0x11366,0x11374},
+    {0x114b3,0x114be},{0x115b2,0x115c0},{0x11633,0x1163a},{0x1163d,0x1163d},
+    {0x1163f,0x11640},{0x116ab,0x116b7},{0x1171d,0x1172b},{0x16af0,0x16af4},
+    {0x16b30,0x16b36},{0x16f8f,0x16f92},{0x1bc9d,0x1bc9e},{0x1d165,0x1d169},
+    {0x1d16d,0x1d182},{0x1d185,0x1d18b},{0x1d1aa,0x1d1ad},{0x1d242,0x1d244},
+    {0x1da00,0x1da36},{0x1da3b,0x1da6c},{0x1da75,0x1da75},{0x1da84,0x1da84},
+    {0x1da9b,0x1daaf},{0x1e000,0x1e02a},{0x1e8d0,0x1e8d6},{0x1e944,0x1e94a},
+    {0xe0001,0xe01ef}
+};
+
+static const CP_RANGE wide_ranges[] = {
+    {0x1100,0x115f},{0x231a,0x231b},{0x2329,0x232a},{0x23e9,0x23ec},
+    {0x23f0,0x23f0},{0x23f3,0x23f3},{0x25fd,0x25fe},{0x2614,0x2615},
+    {0x2648,0x2653},{0x267f,0x267f},{0x2693,0x2693},{0x26a1,0x26a1},
+    {0x26aa,0x26ab},{0x26bd,0x26be},{0x26c4,0x26c5},{0x26ce,0x26ce},
+    {0x26d4,0x26d4},{0x26ea,0x26ea},{0x26f2,0x26f3},{0x26f5,0x26f5},
+    {0x26fa,0x26fa},{0x26fd,0x26fd},{0x2705,0x2705},{0x270a,0x270b},
+    {0x2728,0x2728},{0x274c,0x274c},{0x274e,0x274e},{0x2753,0x2755},
+    {0x2757,0x2757},{0x2795,0x2797},{0x27b0,0x27b0},{0x27bf,0x27bf},
+    {0x2b1b,0x2b1c},{0x2b50,0x2b50},{0x2b55,0x2b55},{0x2e80,0x303e},
+    {0x3041,0x33ff},{0x3400,0x4dbf},{0x4e00,0x9fff},{0xa000,0xa4cf},
+    {0xa960,0xa97f},{0xac00,0xd7a3},{0xf900,0xfaff},{0xfe10,0xfe19},
+    {0xfe30,0xfe6f},{0xff00,0xff60},{0xffe0,0xffe6},{0x16fe0,0x16fe1},
+    {0x17000,0x18aff},{0x1b000,0x1b12f},{0x1b170,0x1b2ff},{0x1f004,0x1f004},
+    {0x1f0cf,0x1f0cf},{0x1f18e,0x1f18e},{0x1f191,0x1f19a},{0x1f1e6,0x1f1ff},
+    {0x1f200,0x1f320},{0x1f32d,0x1f335},{0x1f337,0x1f37c},{0x1f37e,0x1f393},
+    {0x1f3a0,0x1f3ca},{0x1f3cf,0x1f3d3},{0x1f3e0,0x1f3f0},{0x1f3f4,0x1f3f4},
+    {0x1f3f8,0x1f43e},{0x1f440,0x1f440},{0x1f442,0x1f4fc},{0x1f4ff,0x1f53d},
+    {0x1f54b,0x1f54e},{0x1f550,0x1f567},{0x1f57a,0x1f57a},{0x1f595,0x1f596},
+    {0x1f5a4,0x1f5a4},{0x1f5fb,0x1f64f},{0x1f680,0x1f6c5},{0x1f6cc,0x1f6cc},
+    {0x1f6d0,0x1f6d2},{0x1f6eb,0x1f6ec},{0x1f6f4,0x1f6f9},{0x1f910,0x1f93e},
+    {0x1f940,0x1f970},{0x1f973,0x1f976},{0x1f97a,0x1f97a},{0x1f97c,0x1f9a2},
+    {0x1f9b0,0x1f9b9},{0x1f9c0,0x1f9c2},{0x1f9d0,0x1f9ff},{0x1fa60,0x1fa6d},
+    {0x20000,0x2fffd},{0x30000,0x3fffd}
+};
+
+static int
+cp_range_contains(const CP_RANGE* ranges, int n, unsigned cp)
+{
+    int lo = 0, hi = n - 1;
+    while(lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if(cp < ranges[mid].lo)      hi = mid - 1;
+        else if(cp > ranges[mid].hi) lo = mid + 1;
+        else                         return 1;
+    }
+    return 0;
+}
+
+/* Display width (columns) of a Unicode codepoint: 0 for combining/format
+ * marks, 2 for East Asian Wide/Fullwidth and most emoji, 1 otherwise.
+ *
+ * This is a per-codepoint approximation; it does not perform grapheme-cluster
+ * segmentation, so ZWJ emoji sequences (e.g. family/flag emoji) may measure
+ * wider than they render in terminals that collapse them. */
+static int
+cp_width(unsigned cp)
+{
+    if(cp == 0)
+        return 0;
+    if(cp < 0x20 || (cp >= 0x7f && cp < 0xa0))   /* C0 / C1 controls */
+        return 0;
+    if(cp < 0x0300)                               /* fast path: Latin etc. */
+        return 1;
+    if(cp_range_contains(zero_width_ranges,
+                         (int)(sizeof(zero_width_ranges)/sizeof(zero_width_ranges[0])), cp))
+        return 0;
+    if(cp_range_contains(wide_ranges,
+                         (int)(sizeof(wide_ranges)/sizeof(wide_ranges[0])), cp))
+        return 2;
+    return 1;
+}
+
+/* Length in bytes of an ANSI escape sequence starting at s, or 0 if none. */
+static MD_SIZE
+ansi_esc_len(const char* s, MD_SIZE n)
+{
+    MD_SIZE i;
+    if(n == 0 || (unsigned char) s[0] != 0x1b)
+        return 0;
+    if(n >= 2 && s[1] == '[') {            /* CSI: ESC [ ... final(0x40-0x7e) */
+        i = 2;
+        while(i < n && !((unsigned char) s[i] >= 0x40 && (unsigned char) s[i] <= 0x7e))
+            i++;
+        if(i < n) i++;
+        return i;
+    }
+    if(n >= 2 && s[1] == ']') {            /* OSC: ESC ] ... (BEL | ESC \) */
+        i = 2;
+        while(i < n) {
+            if((unsigned char) s[i] == 0x07) { i++; break; }
+            if((unsigned char) s[i] == 0x1b && i + 1 < n && s[i + 1] == '\\') { i += 2; break; }
+            i++;
+        }
+        return i;
+    }
+    if(n >= 2 && s[1] == '\\')             /* ST */
+        return 2;
+    return 1;
+}
+
+/* Display width of a buffer, ignoring ANSI escape sequences. */
+static int
+ansi_disp_width(const char* buf, MD_SIZE size)
+{
+    MD_SIZE i = 0;
+    int w = 0;
+    while(i < size) {
+        MD_SIZE e = ansi_esc_len(buf + i, size - i);
+        unsigned cp;
+        MD_SIZE cl;
+        if(e > 0) { i += e; continue; }
+        cl = ansi_utf8_decode(buf + i, size - i, &cp);
+        w += cp_width(cp);
+        i += cl;
+    }
+    return w;
+}
+
+/* Detect the terminal width: $COLUMNS, then TIOCGWINSZ, else 80. */
+static int
+table_term_width(void)
+{
+    const char* env = getenv("COLUMNS");
+    if(env != NULL && *env != '\0') {
+        int w = atoi(env);
+        if(w > 0) return w;
+    }
+#ifdef MD4X_ANSI_HAVE_IOCTL
+    {
+        struct winsize ws;
+        if(ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+            return (int) ws.ws_col;
+    }
+#endif
+    return 80;
+}
+
+static void
+table_cell_append(MD_ANSI_TABLE* t, const MD_CHAR* text, MD_SIZE size)
+{
+    MD_ANSI_TCELL* c = t->cur;
+    if(c == NULL || size == 0)
+        return;
+    if(c->size + size > c->cap) {
+        MD_SIZE nc = c->cap ? c->cap * 2 : 64;
+        char* p;
+        while(nc < c->size + size) nc *= 2;
+        p = (char*) realloc(c->buf, nc);
+        if(p == NULL) { t->oom = 1; return; }
+        c->buf = p;
+        c->cap = nc;
+    }
+    memcpy(c->buf + c->size, text, size);
+    c->size += size;
+}
+
+static MD_ANSI_TROW*
+table_push_row(MD_ANSI_TABLE* t, int is_header)
+{
+    MD_ANSI_TROW* row;
+    if(t->n_rows >= t->cap_rows) {
+        int nc = t->cap_rows ? t->cap_rows * 2 : 8;
+        MD_ANSI_TROW* p = (MD_ANSI_TROW*) realloc(t->rows, nc * sizeof(MD_ANSI_TROW));
+        if(p == NULL) { t->oom = 1; return NULL; }
+        t->rows = p;
+        t->cap_rows = nc;
+    }
+    row = &t->rows[t->n_rows++];
+    memset(row, 0, sizeof(*row));
+    row->is_header = is_header;
+    return row;
+}
+
+static MD_ANSI_TCELL*
+table_push_cell(MD_ANSI_TABLE* t)
+{
+    MD_ANSI_TROW* row;
+    MD_ANSI_TCELL* cell;
+    if(t->n_rows == 0)
+        return NULL;
+    row = &t->rows[t->n_rows - 1];
+    if(row->n_cells >= row->cap_cells) {
+        int nc = row->cap_cells ? row->cap_cells * 2 : 4;
+        MD_ANSI_TCELL* p = (MD_ANSI_TCELL*) realloc(row->cells, nc * sizeof(MD_ANSI_TCELL));
+        if(p == NULL) { t->oom = 1; return NULL; }
+        row->cells = p;
+        row->cap_cells = nc;
+    }
+    cell = &row->cells[row->n_cells++];
+    memset(cell, 0, sizeof(*cell));
+    return cell;
+}
+
+static void
+table_set_align(MD_ANSI_TABLE* t, int col, MD_ALIGN align)
+{
+    if(col < 0)
+        return;
+    if(col >= t->cap_aligns) {
+        int nc = t->cap_aligns ? t->cap_aligns : 8;
+        MD_ALIGN* p;
+        int k;
+        while(nc <= col) nc *= 2;
+        p = (MD_ALIGN*) realloc(t->aligns, nc * sizeof(MD_ALIGN));
+        if(p == NULL) { t->oom = 1; return; }
+        for(k = t->cap_aligns; k < nc; k++) p[k] = MD_ALIGN_DEFAULT;
+        t->aligns = p;
+        t->cap_aligns = nc;
+    }
+    if(col >= t->n_aligns)
+        t->n_aligns = col + 1;
+    /* Header defines alignment; keep first non-default value seen. */
+    if(t->aligns[col] == MD_ALIGN_DEFAULT)
+        t->aligns[col] = align;
+}
+
+static void
+table_free(MD_ANSI_TABLE* t)
+{
+    int i, j;
+    if(t == NULL)
+        return;
+    for(i = 0; i < t->n_rows; i++) {
+        for(j = 0; j < t->rows[i].n_cells; j++)
+            free(t->rows[i].cells[j].buf);
+        free(t->rows[i].cells);
+    }
+    free(t->rows);
+    free(t->aligns);
+    free(t);
+}
+
+/* Display width of the current line-indent prefix (quote/list/alert chrome). */
+static int
+ansi_indent_width(MD_ANSI* r)
+{
+    char buf[256];
+    ANSI_CAPTURE_BUF cap;
+    void (*saved_out)(const MD_CHAR*, MD_SIZE, void*) = r->process_output;
+    void* saved_ud = r->userdata;
+    MD_ANSI_TABLE* saved_table = r->table;
+    int w;
+
+    cap.buf = buf;
+    cap.size = 0;
+    cap.cap = sizeof(buf);
+
+    r->table = NULL;                 /* prevent cell-capture redirect */
+    r->process_output = ansi_capture_append;
+    r->userdata = &cap;
+    render_indent(r);
+    r->process_output = saved_out;
+    r->userdata = saved_ud;
+    r->table = saved_table;
+
+    w = ansi_disp_width(buf, cap.size);
+    return w;
+}
+
+/* Emit one cell, aligned/padded or truncated with an ellipsis, to fit width. */
+static void
+table_emit_cell(MD_ANSI* r, const MD_ANSI_TCELL* cell, int width,
+                MD_ALIGN align, int is_header)
+{
+    int cw = (cell != NULL) ? ansi_disp_width(cell->buf, cell->size) : 0;
+
+    if(width <= 0)
+        return;
+
+    if(is_header)
+        render_ansi(r, ANSI_BOLD);
+
+    if(cw > width) {
+        MD_SIZE i = 0;
+        int emitted = 0;
+        while(cell != NULL && i < cell->size) {
+            MD_SIZE e = ansi_esc_len(cell->buf + i, cell->size - i);
+            unsigned cp;
+            MD_SIZE cl;
+            int w;
+            if(e > 0) { render_verbatim(r, cell->buf + i, e); i += e; continue; }
+            cl = ansi_utf8_decode(cell->buf + i, cell->size - i, &cp);
+            w = cp_width(cp);
+            if(emitted + w > width - 1)
+                break;
+            render_verbatim(r, cell->buf + i, cl);
+            emitted += w;
+            i += cl;
+        }
+        RENDER_VERBATIM(r, TBL_ELLIPSIS);
+        emitted += 1;
+        while(emitted < width) { RENDER_VERBATIM(r, " "); emitted++; }
+    } else {
+        int pad = width - cw;
+        int lpad = 0, rpad = pad;
+        if(align == MD_ALIGN_RIGHT) { lpad = pad; rpad = 0; }
+        else if(align == MD_ALIGN_CENTER) { lpad = pad / 2; rpad = pad - lpad; }
+        while(lpad-- > 0) RENDER_VERBATIM(r, " ");
+        if(cell != NULL && cell->size > 0)
+            render_verbatim(r, cell->buf, cell->size);
+        while(rpad-- > 0) RENDER_VERBATIM(r, " ");
+    }
+
+    if(is_header)
+        render_ansi(r, ANSI_BOLD_OFF);
+}
+
+static void
+table_emit_row(MD_ANSI* r, MD_ANSI_TROW* row, const int* widths, int n_cols)
+{
+    int j;
+    render_indent(r);
+    for(j = 0; j < n_cols; j++) {
+        const MD_ANSI_TCELL* cell = (j < row->n_cells) ? &row->cells[j] : NULL;
+        MD_ALIGN align = (j < r->table->n_aligns) ? r->table->aligns[j] : MD_ALIGN_DEFAULT;
+        if(j > 0)
+            RENDER_VERBATIM(r, " " TBL_VERT " ");
+        table_emit_cell(r, cell, widths[j], align, row->is_header);
+    }
+    render_newline(r);
+}
+
+static void
+table_emit_separator(MD_ANSI* r, const int* widths, int n_cols)
+{
+    int j, k;
+    render_indent(r);
+    for(j = 0; j < n_cols; j++) {
+        if(j > 0)
+            RENDER_VERBATIM(r, TBL_HORIZ TBL_CROSS TBL_HORIZ);
+        for(k = 0; k < widths[j]; k++)
+            RENDER_VERBATIM(r, TBL_HORIZ);
+    }
+    render_newline(r);
+}
+
+/* Lay out and emit the buffered table. */
+static void
+table_emit(MD_ANSI* r)
+{
+    MD_ANSI_TABLE* t = r->table;
+    int n_cols = 0, i, j;
+    int* widths;
+    int indent_w, avail, total;
+    int any_header = 0, emitted_sep = 0;
+
+    if(t == NULL)
+        return;
+
+    for(i = 0; i < t->n_rows; i++) {
+        if(t->rows[i].n_cells > n_cols) n_cols = t->rows[i].n_cells;
+        if(t->rows[i].is_header) any_header = 1;
+    }
+    if(n_cols == 0)
+        return;
+
+    widths = (int*) calloc((size_t) n_cols, sizeof(int));
+    if(widths == NULL)
+        return;
+
+    /* Natural column widths = max cell display width per column. */
+    for(i = 0; i < t->n_rows; i++) {
+        MD_ANSI_TROW* row = &t->rows[i];
+        for(j = 0; j < row->n_cells; j++) {
+            int w = ansi_disp_width(row->cells[j].buf, row->cells[j].size);
+            if(w > widths[j]) widths[j] = w;
+        }
+    }
+
+    /* Fit to width. Column separators add 3 cols (" │ ") per gap.
+     * Width mode: >0 fixed, 0 unlimited (no shrink), <0 auto-detect. */
+    indent_w = ansi_indent_width(r);
+    if(r->table_width > 0)
+        avail = r->table_width - indent_w;
+    else if(r->table_width == MD_ANSI_WIDTH_INF)
+        avail = INT_MAX;
+    else
+        avail = table_term_width() - indent_w;
+    if(avail < n_cols) avail = n_cols;
+
+    total = 3 * (n_cols - 1);
+    for(j = 0; j < n_cols; j++) total += widths[j];
+
+    while(total > avail) {
+        int wi = 0;
+        for(j = 1; j < n_cols; j++)
+            if(widths[j] > widths[wi]) wi = j;
+        if(widths[wi] <= 1) break;
+        widths[wi]--;
+        total--;
+    }
+
+    for(i = 0; i < t->n_rows; i++) {
+        MD_ANSI_TROW* row = &t->rows[i];
+        if(!row->is_header && any_header && !emitted_sep) {
+            table_emit_separator(r, widths, n_cols);
+            emitted_sep = 1;
+        }
+        table_emit_row(r, row, widths, n_cols);
+    }
+    if(any_header && !emitted_sep)
+        table_emit_separator(r, widths, n_cols);
+
+    free(widths);
+}
+
+
 /**************************************
  ***  ANSI renderer implementation  ***
  **************************************/
@@ -620,23 +1171,35 @@ enter_block_callback(MD_BLOCKTYPE type, void* detail, void* userdata)
                 render_separator(r);
                 r->need_newline = 0;
             }
+            /* Begin buffering: cells are captured, then laid out on leave. */
+            r->table = (MD_ANSI_TABLE*) calloc(1, sizeof(MD_ANSI_TABLE));
             break;
 
         case MD_BLOCK_THEAD:
+            if(r->table != NULL) r->table->cur_is_header = 1;
             break;
 
         case MD_BLOCK_TBODY:
+            if(r->table != NULL) r->table->cur_is_header = 0;
             break;
 
         case MD_BLOCK_TR:
-            render_indent(r);
+            if(r->table != NULL)
+                table_push_row(r->table, r->table->cur_is_header);
             break;
 
         case MD_BLOCK_TH:
-            render_ansi(r, ANSI_BOLD);
-            break;
-
         case MD_BLOCK_TD:
+            if(r->table != NULL) {
+                MD_ANSI_TCELL* cell = table_push_cell(r->table);
+                const MD_BLOCK_TD_DETAIL* td = (const MD_BLOCK_TD_DETAIL*) detail;
+                if(r->table->n_rows > 0) {
+                    int col = r->table->rows[r->table->n_rows - 1].n_cells - 1;
+                    if(td != NULL) table_set_align(r->table, col, td->align);
+                }
+                r->table->cur = cell;
+                r->table->capturing = 1;
+            }
             break;
 
         case MD_BLOCK_FRONTMATTER:
@@ -796,31 +1359,30 @@ leave_block_callback(MD_BLOCKTYPE type, void* detail, void* userdata)
             break;
 
         case MD_BLOCK_TABLE:
+            if(r->table != NULL) {
+                if(!r->table->oom)
+                    table_emit(r);
+                table_free(r->table);
+                r->table = NULL;
+            }
             r->need_newline = 1;
             break;
 
         case MD_BLOCK_THEAD:
-            render_indent(r);
-            render_ansi(r, ANSI_DIM);
-            RENDER_VERBATIM(r, HORIZONTAL_RULE);
-            render_ansi(r, ANSI_DIM_OFF);
-            render_newline(r);
             break;
 
         case MD_BLOCK_TBODY:
             break;
 
         case MD_BLOCK_TR:
-            render_newline(r);
             break;
 
         case MD_BLOCK_TH:
-            render_ansi(r, ANSI_BOLD_OFF);
-            RENDER_VERBATIM(r, "\t");
-            break;
-
         case MD_BLOCK_TD:
-            RENDER_VERBATIM(r, "\t");
+            if(r->table != NULL) {
+                r->table->capturing = 0;
+                r->table->cur = NULL;
+            }
             break;
 
         case MD_BLOCK_FRONTMATTER:
@@ -954,6 +1516,13 @@ text_callback(MD_TEXTTYPE type, const MD_CHAR* text, MD_SIZE size, void* userdat
     if(r->in_comp_frontmatter)
         return 0;
 
+    /* Inside a table cell, line breaks collapse to a single space. */
+    if(r->table != NULL && r->table->capturing
+       && (type == MD_TEXT_BR || type == MD_TEXT_SOFTBR)) {
+        RENDER_VERBATIM(r, " ");
+        return 0;
+    }
+
     switch(type) {
         case MD_TEXT_NULLCHAR:
             render_utf8_codepoint(r, 0x0000, render_verbatim);
@@ -1024,6 +1593,16 @@ md_ansi(const MD_CHAR* input, MD_SIZE input_size,
         void (*process_output)(const MD_CHAR*, MD_SIZE, void*),
         void* userdata, unsigned parser_flags, unsigned renderer_flags)
 {
+    return md_ansi_ex(input, input_size, process_output, userdata,
+                      parser_flags, renderer_flags, MD_ANSI_WIDTH_AUTO);
+}
+
+int
+md_ansi_ex(const MD_CHAR* input, MD_SIZE input_size,
+           void (*process_output)(const MD_CHAR*, MD_SIZE, void*),
+           void* userdata, unsigned parser_flags, unsigned renderer_flags,
+           int width)
+{
     MD_ANSI render;
     MD_PARSER parser;
 
@@ -1035,8 +1614,8 @@ md_ansi(const MD_CHAR* input, MD_SIZE input_size,
             free(hbuf.data);
             return -1;
         }
-        ret = md_ansi(hbuf.data, hbuf.size, process_output, userdata,
-                      parser_flags, renderer_flags & ~MD_ANSI_FLAG_HEAL);
+        ret = md_ansi_ex(hbuf.data, hbuf.size, process_output, userdata,
+                         parser_flags, renderer_flags & ~MD_ANSI_FLAG_HEAL, width);
         free(hbuf.data);
         return ret;
     }
@@ -1054,6 +1633,7 @@ md_ansi(const MD_CHAR* input, MD_SIZE input_size,
     render.process_output = process_output;
     render.userdata = userdata;
     render.flags = renderer_flags;
+    render.table_width = width;
 
     /* Consider skipping UTF-8 byte order mark (BOM). */
     if(renderer_flags & MD_ANSI_FLAG_SKIP_UTF8_BOM  &&  sizeof(MD_CHAR) == 1) {
@@ -1072,6 +1652,10 @@ md_ansi(const MD_CHAR* input, MD_SIZE input_size,
                 render_ansi_code_meta_json(&render);
             ansi_code_meta_cleanup(&render);
         }
+
+        /* Free any table left dangling by an aborted parse. */
+        if(render.table != NULL)
+            table_free(render.table);
 
         return ret;
     }

@@ -36,6 +36,16 @@
 #include "md4x-heal.h"
 #include "cmdline.h"
 
+#ifdef _WIN32
+    #include <io.h>
+    #define md4x_isatty(fd) _isatty(fd)
+    #define md4x_fileno(f) _fileno(f)
+#else
+    #include <unistd.h>
+    #define md4x_isatty(fd) isatty(fd)
+    #define md4x_fileno(f) fileno(f)
+#endif
+
 
 
 /* Output format. */
@@ -62,6 +72,11 @@ static int want_fullhtml = 0;
 static int want_heal = 0;
 static int want_stat = 0;
 static int want_replay_fuzz = 0;
+
+/* ANSI output: color mode and table width. */
+typedef enum { COLOR_AUTO, COLOR_ON, COLOR_OFF } ColorMode;
+static ColorMode color_mode = COLOR_AUTO;
+static int ansi_width = MD_ANSI_WIDTH_AUTO; /* >0 fixed, 0 inf, <0 auto */
 
 static const char* html_title = NULL;
 static const char* css_path = NULL;
@@ -220,12 +235,24 @@ process_file(const char* in_path, FILE* in, FILE* out)
         }
         case FORMAT_ANSI: {
             unsigned a_flags = MD_ANSI_FLAG_DEBUG;
+            int use_color;
 #ifndef MD4X_USE_ASCII
             a_flags |= MD_ANSI_FLAG_SKIP_UTF8_BOM;
 #endif
             if(want_heal) a_flags |= MD_ANSI_FLAG_HEAL;
-            ret = md_ansi(buf_in.data, (MD_SIZE)buf_in.size, process_output,
-                        (void*) &buf_out, p_flags, a_flags);
+
+            /* Resolve color: auto = enabled only when output is a terminal. */
+            if(color_mode == COLOR_ON)
+                use_color = 1;
+            else if(color_mode == COLOR_OFF)
+                use_color = 0;
+            else
+                use_color = md4x_isatty(md4x_fileno(out));
+            if(!use_color)
+                a_flags |= MD_ANSI_FLAG_NO_COLOR;
+
+            ret = md_ansi_ex(buf_in.data, (MD_SIZE)buf_in.size, process_output,
+                        (void*) &buf_out, p_flags, a_flags, ansi_width);
             break;
         }
         case FORMAT_TEXT: {
@@ -294,6 +321,9 @@ static const CMDLINE_OPTION cmdline_options[] = {
 
     { 't', "format",                        '3', CMDLINE_OPTFLAG_REQUIREDARG },
 
+    {  0,  "color",                         '5', CMDLINE_OPTFLAG_REQUIREDARG },
+    {  0,  "width",                         '6', CMDLINE_OPTFLAG_REQUIREDARG },
+
     {  0,  "html-title",                    '1', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "html-css",                      '2', CMDLINE_OPTFLAG_REQUIREDARG },
 
@@ -317,6 +347,10 @@ usage(void)
         "  -s, --stat           Measure time of input parsing\n"
         "  -h, --help           Display this help and exit\n"
         "  -v, --version        Display version and exit\n"
+        "\n"
+        "ANSI output options (--format=ansi):\n"
+        "      --color=MODE     Color output: auto (default), on, off\n"
+        "      --width=WIDTH    Table width: auto (default), inf, or a column count\n"
         "\n"
         "HTML output options:\n"
         "  -f, --full-html      Generate full HTML document, including header\n"
@@ -375,6 +409,36 @@ cmdline_callback(int opt, char const* value, void* data)
                 fprintf(stderr, "Unknown format: %s\n", value);
                 fprintf(stderr, "Supported formats: html, text, json, ansi, markdown, heal\n");
                 exit(1);
+            }
+            break;
+
+        case '5':   /* --color=auto|on|off */
+            if(strcmp(value, "auto") == 0)
+                color_mode = COLOR_AUTO;
+            else if(strcmp(value, "on") == 0 || strcmp(value, "always") == 0)
+                color_mode = COLOR_ON;
+            else if(strcmp(value, "off") == 0 || strcmp(value, "never") == 0)
+                color_mode = COLOR_OFF;
+            else {
+                fprintf(stderr, "Invalid --color value: %s (use auto, on, or off)\n", value);
+                exit(1);
+            }
+            break;
+
+        case '6':   /* --width=auto|inf|0|<n> */
+            if(strcmp(value, "auto") == 0) {
+                ansi_width = MD_ANSI_WIDTH_AUTO;
+            } else if(strcmp(value, "inf") == 0) {
+                ansi_width = MD_ANSI_WIDTH_INF;
+            } else {
+                char* end = NULL;
+                long w = strtol(value, &end, 10);
+                if(end == value || *end != '\0' || w < 0 || w > 100000) {
+                    fprintf(stderr, "Invalid --width value: %s (use auto, inf, 0, or a column count)\n", value);
+                    exit(1);
+                }
+                /* 0 == inf (unlimited), as documented. */
+                ansi_width = (int) w;
             }
             break;
 

@@ -60,6 +60,26 @@ extern "C"
                 void (*process_output)(const MD_CHAR *, MD_SIZE, void *),
                 void *userdata, unsigned parser_flags, unsigned renderer_flags);
 
+/* Table width modes for md_ansi_ex(). */
+#define MD_ANSI_WIDTH_AUTO (-1) /* detect from $COLUMNS / terminal, else 80 */
+#define MD_ANSI_WIDTH_INF 0     /* unlimited: size tables to content, no wrap */
+
+    /* Like md_ansi(), but with an explicit table layout width.
+     *
+     * Param width controls table fit-to-width:
+     *   > 0                  use this fixed width (columns).
+     *   MD_ANSI_WIDTH_INF(0) unlimited width: tables are sized to content and
+     *                        never shrunk/truncated.
+     *   MD_ANSI_WIDTH_AUTO   auto-detect from $COLUMNS or the terminal
+     *                        (falls back to 80).
+     *
+     * md_ansi() is equivalent to md_ansi_ex() with width = MD_ANSI_WIDTH_AUTO.
+     */
+    int md_ansi_ex(const MD_CHAR *input, MD_SIZE input_size,
+                   void (*process_output)(const MD_CHAR *, MD_SIZE, void *),
+                   void *userdata, unsigned parser_flags, unsigned renderer_flags,
+                   int width);
+
 #ifdef __cplusplus
 } /* extern "C" { */
 #endif
