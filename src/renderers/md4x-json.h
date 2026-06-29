@@ -28,7 +28,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <yaml.h>
+#include <libfyaml.h>
 #include "md4x.h"
 
 #ifdef _WIN32
@@ -191,14 +191,21 @@ yaml_is_number(const char *s, MD_SIZE len)
 /* Write a YAML scalar as a typed JSON value.
  * Applies YAML 1.1 type resolution for plain scalars. */
 static void
-json_write_yaml_scalar(JSON_WRITER *w, const yaml_event_t *event)
+json_write_yaml_scalar(JSON_WRITER *w, struct fy_event *event)
 {
-    const char *val = (const char *)event->data.scalar.value;
-    MD_SIZE len = (MD_SIZE)event->data.scalar.length;
-    yaml_scalar_style_t style = event->data.scalar.style;
+    size_t tlen = 0;
+    const char *val = fy_token_get_text(event->scalar.value, &tlen);
+    MD_SIZE len = (MD_SIZE)tlen;
+    enum fy_scalar_style style = fy_token_scalar_style(event->scalar.value);
+
+    if (val == NULL)
+    {
+        json_write_str(w, "null");
+        return;
+    }
 
     /* Quoted scalars are always strings. */
-    if (style == YAML_SINGLE_QUOTED_SCALAR_STYLE || style == YAML_DOUBLE_QUOTED_SCALAR_STYLE)
+    if (style == FYSS_SINGLE_QUOTED || style == FYSS_DOUBLE_QUOTED)
     {
         json_write_string(w, val, len);
         return;
@@ -236,30 +243,31 @@ json_write_yaml_scalar(JSON_WRITER *w, const yaml_event_t *event)
 }
 
 /* Forward declarations for recursive YAML-to-JSON writing. */
-static int json_write_yaml_value(JSON_WRITER *w, yaml_parser_t *yp);
+static int json_write_yaml_value(JSON_WRITER *w, struct fy_parser *yp);
 
 /* Write a YAML mapping as JSON object key-value pairs (without outer braces).
  * Assumes MAPPING_START has been consumed. Returns number of pairs, or -1 on error. */
 static int
-json_write_yaml_mapping(JSON_WRITER *w, yaml_parser_t *yp)
+json_write_yaml_mapping(JSON_WRITER *w, struct fy_parser *yp)
 {
-    yaml_event_t event;
+    struct fy_event *event;
     int n = 0;
 
     while (1)
     {
-        if (!yaml_parser_parse(yp, &event))
+        event = fy_parser_parse(yp);
+        if (event == NULL)
             return -1;
 
-        if (event.type == YAML_MAPPING_END_EVENT)
+        if (event->type == FYET_MAPPING_END)
         {
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             break;
         }
 
-        if (event.type != YAML_SCALAR_EVENT)
+        if (event->type != FYET_SCALAR)
         {
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             return -1;
         }
 
@@ -267,11 +275,15 @@ json_write_yaml_mapping(JSON_WRITER *w, yaml_parser_t *yp)
             json_write(w, ",", 1);
 
         /* Write key. */
-        json_write(w, "\"", 1);
-        json_write_escaped(w, (const char *)event.data.scalar.value,
-                           (MD_SIZE)event.data.scalar.length);
-        json_write_str(w, "\":");
-        yaml_event_delete(&event);
+        {
+            size_t klen = 0;
+            const char *key = fy_token_get_text(event->scalar.value, &klen);
+            json_write(w, "\"", 1);
+            if (key != NULL)
+                json_write_escaped(w, key, (MD_SIZE)klen);
+            json_write_str(w, "\":");
+        }
+        fy_parser_event_free(yp, event);
 
         /* Write value (recursive). */
         if (json_write_yaml_value(w, yp) < 0)
@@ -285,49 +297,50 @@ json_write_yaml_mapping(JSON_WRITER *w, yaml_parser_t *yp)
 /* Write a YAML sequence as a JSON array.
  * Assumes SEQUENCE_START has been consumed. Returns 0 on success, -1 on error. */
 static int
-json_write_yaml_sequence(JSON_WRITER *w, yaml_parser_t *yp)
+json_write_yaml_sequence(JSON_WRITER *w, struct fy_parser *yp)
 {
-    yaml_event_t event;
+    struct fy_event *event;
     int n = 0;
 
     json_write(w, "[", 1);
 
     while (1)
     {
-        if (!yaml_parser_parse(yp, &event))
+        event = fy_parser_parse(yp);
+        if (event == NULL)
             return -1;
 
-        if (event.type == YAML_SEQUENCE_END_EVENT)
+        if (event->type == FYET_SEQUENCE_END)
         {
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             break;
         }
 
         if (n > 0)
             json_write(w, ",", 1);
 
-        if (event.type == YAML_SCALAR_EVENT)
+        if (event->type == FYET_SCALAR)
         {
-            json_write_yaml_scalar(w, &event);
-            yaml_event_delete(&event);
+            json_write_yaml_scalar(w, event);
+            fy_parser_event_free(yp, event);
         }
-        else if (event.type == YAML_MAPPING_START_EVENT)
+        else if (event->type == FYET_MAPPING_START)
         {
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             json_write(w, "{", 1);
             if (json_write_yaml_mapping(w, yp) < 0)
                 return -1;
             json_write(w, "}", 1);
         }
-        else if (event.type == YAML_SEQUENCE_START_EVENT)
+        else if (event->type == FYET_SEQUENCE_START)
         {
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             if (json_write_yaml_sequence(w, yp) < 0)
                 return -1;
         }
         else
         {
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             return -1;
         }
 
@@ -341,95 +354,101 @@ json_write_yaml_sequence(JSON_WRITER *w, yaml_parser_t *yp)
 /* Write the next YAML value (scalar, mapping, or sequence) as JSON.
  * Returns 0 on success, -1 on error. */
 static int
-json_write_yaml_value(JSON_WRITER *w, yaml_parser_t *yp)
+json_write_yaml_value(JSON_WRITER *w, struct fy_parser *yp)
 {
-    yaml_event_t event;
+    struct fy_event *event;
 
-    if (!yaml_parser_parse(yp, &event))
+    event = fy_parser_parse(yp);
+    if (event == NULL)
         return -1;
 
-    if (event.type == YAML_SCALAR_EVENT)
+    if (event->type == FYET_SCALAR)
     {
-        json_write_yaml_scalar(w, &event);
-        yaml_event_delete(&event);
+        json_write_yaml_scalar(w, event);
+        fy_parser_event_free(yp, event);
         return 0;
     }
-    if (event.type == YAML_MAPPING_START_EVENT)
+    if (event->type == FYET_MAPPING_START)
     {
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
         json_write(w, "{", 1);
         if (json_write_yaml_mapping(w, yp) < 0)
             return -1;
         json_write(w, "}", 1);
         return 0;
     }
-    if (event.type == YAML_SEQUENCE_START_EVENT)
+    if (event->type == FYET_SEQUENCE_START)
     {
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
         return json_write_yaml_sequence(w, yp);
     }
-    if (event.type == YAML_ALIAS_EVENT)
+    if (event->type == FYET_ALIAS)
     {
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
         json_write_str(w, "null");
         return 0;
     }
 
-    yaml_event_delete(&event);
+    fy_parser_event_free(yp, event);
     return -1;
 }
 
-/* Write parsed YAML frontmatter as JSON props using libyaml.
+/* Write parsed YAML frontmatter as JSON props using libfyaml.
  * Supports nested objects, arrays, and all YAML scalar types.
  * Returns number of top-level props written. */
 static int
 json_write_yaml_props(JSON_WRITER *w, const char *text, MD_SIZE size)
 {
-    yaml_parser_t yp;
-    yaml_event_t event;
+    struct fy_parser *yp;
+    struct fy_event *event;
     int n_written = 0;
 
-    if (!yaml_parser_initialize(&yp))
+    yp = fy_parser_create(NULL);
+    if (yp == NULL)
         return 0;
 
-    yaml_parser_set_input_string(&yp, (const unsigned char *)text, size);
+    if (fy_parser_set_string(yp, text, (size_t)size) != 0)
+        goto done;
 
     /* Consume STREAM_START. */
-    if (!yaml_parser_parse(&yp, &event))
+    event = fy_parser_parse(yp);
+    if (event == NULL)
         goto done;
-    if (event.type != YAML_STREAM_START_EVENT)
+    if (event->type != FYET_STREAM_START)
     {
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
         goto done;
     }
-    yaml_event_delete(&event);
+    fy_parser_event_free(yp, event);
 
     /* Consume DOCUMENT_START. */
-    if (!yaml_parser_parse(&yp, &event))
+    event = fy_parser_parse(yp);
+    if (event == NULL)
         goto done;
-    if (event.type != YAML_DOCUMENT_START_EVENT)
+    if (event->type != FYET_DOCUMENT_START)
     {
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
         goto done;
     }
-    yaml_event_delete(&event);
+    fy_parser_event_free(yp, event);
 
     /* Expect top-level MAPPING_START. */
-    if (!yaml_parser_parse(&yp, &event))
+    event = fy_parser_parse(yp);
+    if (event == NULL)
         goto done;
-    if (event.type != YAML_MAPPING_START_EVENT)
+    if (event->type != FYET_MAPPING_START)
     {
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
         goto done;
     }
-    yaml_event_delete(&event);
+    fy_parser_event_free(yp, event);
 
-    n_written = json_write_yaml_mapping(w, &yp);
+    n_written = json_write_yaml_mapping(w, yp);
     if (n_written < 0)
         n_written = 0;
 
 done:
-    yaml_parser_delete(&yp);
+    fy_parser_destroy(yp);
     return n_written;
 }
 

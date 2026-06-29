@@ -9,7 +9,7 @@
 - **License:** MIT
 - **Language:** C (C89/C99 compatible)
 - **Spec:** CommonMark 0.31.2
-- **Build:** Zig (`zig build`)
+- **Build:** Zig (`zig build`, all targets) or CMake (`cmake`, C build only)
 - **JS Runtime:** Bun (do **not** use npm, pnpm, yarn, or npx — use `bun`/`bunx` exclusively)
 - **Formatting:** Always run `bun fmt` after finishing code changes
 
@@ -107,13 +107,16 @@ website/                 # Docs + playground (Vite + Vue)
 package.json             # Root workspace package (bun, workspaces: packages/*, website)
 build.zig                # Zig build script
 build.zig.zon            # Zig package manifest
+CMakeLists.txt           # CMake build script (C build only, ctest test suites)
 .github/workflows/
   ci-build.yml         # Build + test (Linux/Windows, debug/release, coverage)
 ```
 
 ## Building
 
-Uses Zig build system. External dependency: [libyaml](https://github.com/yaml/libyaml) 0.2.5 (YAML parser for AST/meta renderer frontmatter, fetched automatically via `build.zig.zon`).
+External dependency: [libfyaml](https://github.com/pantoniou/libfyaml) (YAML parser for HTML/AST/meta renderer frontmatter). The CMake build locates it via `find_package(libfyaml CONFIG REQUIRED)`, so it must be installed on the system.
+
+### Zig (primary build, all targets)
 
 ```sh
 zig build                          # build all (defaults to ReleaseFast)
@@ -124,6 +127,16 @@ zig build && zig-out/bin/md4x --help  # run md4x CLI
 Outputs to `zig-out/` (`bin/md4x`, `lib/libmd4x*.a`, `include/md4x*.h`).
 
 The project can also be consumed as a Zig package dependency via `build.zig.zon`.
+
+### CMake (C build only)
+
+`CMakeLists.txt` builds only the C artifacts (libraries + `md4x` CLI) — it does **not** cover the WASM/NAPI/JS targets. It uses a direct CMake package dependency for libfyaml (no pkg-config) and registers the test suites with ctest.
+
+```sh
+cmake -S . -B build                # configure (find_package(libfyaml CONFIG REQUIRED))
+cmake --build build -j             # build libraries + md4x CLI
+ctest --test-dir build             # run all test suites (see Testing below)
+```
 
 Produces four static libraries, one executable, and optional WASM/NAPI targets:
 
@@ -143,6 +156,18 @@ Compiler flags: `-Wall -Wextra -Wshadow -Wdeclaration-after-statement -O2`
 
 ## Testing
 
+**ctest is the preferred way to run the test suites.** Each `test/*.txt` suite is registered as an individual ctest test, plus a `pathological` stress test.
+
+```sh
+# Preferred: build with CMake, then run via ctest:
+cmake -S . -B build && cmake --build build -j
+ctest --test-dir build                       # run everything
+ctest --test-dir build --output-on-failure   # show failures
+ctest --test-dir build -R spec-frontmatter   # run a single suite by name
+```
+
+Alternative runners (e.g. against a `zig build` binary):
+
 ```sh
 # Run all test suites:
 bun scripts/run-tests.ts
@@ -160,7 +185,7 @@ Test suites: `spec.txt`, `spec-tables.txt`, `spec-strikethrough.txt`, `spec-task
 
 ## Fuzzing
 
-LibFuzzer harnesses for all renderers and the heal utility. Requires clang with LibFuzzer and libyaml.
+LibFuzzer harnesses for all renderers and the heal utility. Requires clang with LibFuzzer and libfyaml.
 
 ```sh
 # Build & run a fuzzer (builds automatically, 60s default):
@@ -182,11 +207,11 @@ Output goes to `fuzz-out/` (gitignored). Environment variables: `CC` (compiler, 
 
 | Harness             | Target          | Notes                                                 |
 | ------------------- | --------------- | ----------------------------------------------------- |
-| `fuzz-mdhtml.c`     | `md_html()`     | HTML renderer + libyaml                               |
-| `fuzz-mdast.c`      | `md_ast()`      | AST renderer (in-memory tree, libyaml) — highest risk |
+| `fuzz-mdhtml.c`     | `md_html()`     | HTML renderer + libfyaml                              |
+| `fuzz-mdast.c`      | `md_ast()`      | AST renderer (in-memory tree, libfyaml) — highest risk |
 | `fuzz-mdansi.c`     | `md_ansi()`     | ANSI terminal renderer                                |
 | `fuzz-mdtext.c`     | `md_text()`     | Plain text renderer                                   |
-| `fuzz-mdmeta.c`     | `md_meta()`     | Metadata extractor + libyaml                          |
+| `fuzz-mdmeta.c`     | `md_meta()`     | Metadata extractor + libfyaml                         |
 | `fuzz-mdmarkdown.c` | `md_markdown()` | Markdown renderer                                     |
 | `fuzz-mdheal.c`     | `md_heal()`     | Heal utility (no flags, no parser dependency)         |
 

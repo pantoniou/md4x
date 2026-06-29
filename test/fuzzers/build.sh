@@ -7,7 +7,7 @@
 #
 # Requirements:
 #   - clang with LibFuzzer support
-#   - libyaml (for ast/meta fuzzers)
+#   - libfyaml (for html/ast/meta fuzzers)
 #
 # Run a fuzzer:
 #   ./fuzz-mdhtml  test/fuzzers/seed-corpus/
@@ -51,7 +51,7 @@ build_html() {
         "$SRC/md4x.c" "$SRC/entity.c" \
         "$RENDERERS/md4x-html.c" \
         "$RENDERERS/md4x-heal.c" \
-        -lyaml \
+        -lfyaml \
         -o "$OUT_DIR/fuzz-mdhtml"
 }
 
@@ -62,7 +62,7 @@ build_ast() {
         "$SRC/md4x.c" "$SRC/entity.c" \
         "$RENDERERS/md4x-ast.c" \
         "$RENDERERS/md4x-heal.c" \
-        -lyaml \
+        -lfyaml \
         -o "$OUT_DIR/fuzz-mdast"
 }
 
@@ -93,7 +93,7 @@ build_meta() {
         "$SRC/md4x.c" "$SRC/entity.c" \
         "$RENDERERS/md4x-meta.c" \
         "$RENDERERS/md4x-heal.c" \
-        -lyaml \
+        -lfyaml \
         -o "$OUT_DIR/fuzz-mdmeta"
 }
 

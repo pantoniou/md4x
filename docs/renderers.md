@@ -155,7 +155,7 @@ Header-only utility providing JSON serialization and YAML-to-JSON conversion hel
 - `JSON_WRITER` — Streaming JSON writer struct with callback-based output
 - `json_write()` / `json_write_str()` — Raw and string output helpers
 - `json_write_escaped()` / `json_write_string()` — JSON-escaped string output
-- `json_write_yaml_props()` — Parses YAML frontmatter and writes key-value pairs as JSON properties (using libyaml)
+- `json_write_yaml_props()` — Parses YAML frontmatter and writes key-value pairs as JSON properties (using libfyaml)
 
 ## Meta Renderer API (`md4x-meta.h`)
 
@@ -191,7 +191,7 @@ Produces a flat JSON object with frontmatter properties spread at the top level 
 
 ### Rendering Details
 
-- Frontmatter YAML properties are spread as top-level JSON keys (using libyaml for full YAML 1.1 support)
+- Frontmatter YAML properties are spread as top-level JSON keys (using libfyaml for full YAML 1.1 support)
 - Headings are collected as `{"level": N, "text": "..."}` objects in the `headings` array
 - Heading text is extracted as plain text — inline formatting (bold, italic, code, etc.) is stripped
 - HTML entities in headings are resolved to UTF-8 characters

@@ -2,6 +2,15 @@
 
 ## v0.0.18 (WIP)
 
+### Changes
+
+- **YAML parser switched from libyaml to [libfyaml](https://github.com/pantoniou/libfyaml)**: The HTML, AST, and meta renderers now parse frontmatter with libfyaml instead of libyaml. Frontmatter behavior (nested objects, arrays, multi-line scalars, type coercion) is unchanged. The Zig build fetches libfyaml automatically; the CMake build requires it to be installed.
+
+### Build
+
+- **CMake build (C only)**: New `CMakeLists.txt` building the parser/renderer static libraries and the `md4x` CLI. It uses `find_package(libfyaml CONFIG REQUIRED)` (direct CMake package dependency, no pkg-config) and does not cover the WASM/NAPI/JS targets.
+- **ctest**: The test suites (`test/*.txt`) and the pathological stress test are registered as ctest tests and are the preferred way to run them: `ctest --test-dir build`.
+
 ### Features
 
 - **Block component title (VitePress-style custom containers)**: Block components now support a title text after the component name: `:::danger STOP`, `:::details Click me`, `:::info My Title {props}`. The title is rendered as a `title` attribute in HTML, a `"title"` prop in JSON AST, and as the display label in ANSI output.

@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <yaml.h>
+#include <libfyaml.h>
 
 #include "md4x-html.h"
 #include "md4x-props.h"
@@ -564,78 +564,85 @@ comp_fm_flush_tag(MD_HTML* r)
 
     /* If we captured YAML, parse and emit as attributes. */
     if(r->comp_fm_text != NULL && r->comp_fm_text_size > 0) {
-        yaml_parser_t yp;
-        yaml_event_t event;
+        struct fy_parser* yp = fy_parser_create(NULL);
+        struct fy_event* event;
 
-        if(yaml_parser_initialize(&yp)) {
-            yaml_parser_set_input_string(&yp, (const unsigned char*) r->comp_fm_text,
-                                         r->comp_fm_text_size);
-
+        if(yp != NULL && fy_parser_set_string(yp, r->comp_fm_text,
+                                              (size_t) r->comp_fm_text_size) == 0) {
             /* STREAM_START */
-            if(yaml_parser_parse(&yp, &event) && event.type == YAML_STREAM_START_EVENT) {
-                yaml_event_delete(&event);
+            event = fy_parser_parse(yp);
+            if(event != NULL && event->type == FYET_STREAM_START) {
+                fy_parser_event_free(yp, event);
                 /* DOCUMENT_START */
-                if(yaml_parser_parse(&yp, &event) && event.type == YAML_DOCUMENT_START_EVENT) {
-                    yaml_event_delete(&event);
+                event = fy_parser_parse(yp);
+                if(event != NULL && event->type == FYET_DOCUMENT_START) {
+                    fy_parser_event_free(yp, event);
                     /* MAPPING_START */
-                    if(yaml_parser_parse(&yp, &event) && event.type == YAML_MAPPING_START_EVENT) {
-                        yaml_event_delete(&event);
+                    event = fy_parser_parse(yp);
+                    if(event != NULL && event->type == FYET_MAPPING_START) {
+                        fy_parser_event_free(yp, event);
                         /* Iterate key-value pairs. */
-                        while(yaml_parser_parse(&yp, &event)) {
+                        while((event = fy_parser_parse(yp)) != NULL) {
                             char key_buf[256];
-                            size_t key_len;
-                            if(event.type == YAML_MAPPING_END_EVENT) {
-                                yaml_event_delete(&event);
+                            size_t key_len = 0;
+                            const char* key_text;
+                            if(event->type == FYET_MAPPING_END) {
+                                fy_parser_event_free(yp, event);
                                 break;
                             }
-                            if(event.type != YAML_SCALAR_EVENT) {
-                                yaml_event_delete(&event);
+                            if(event->type != FYET_SCALAR) {
+                                fy_parser_event_free(yp, event);
                                 break;
                             }
-                            key_len = event.data.scalar.length;
+                            key_text = fy_token_get_text(event->scalar.value, &key_len);
+                            if(key_text == NULL) key_len = 0;
                             if(key_len >= sizeof(key_buf)) key_len = sizeof(key_buf) - 1;
-                            memcpy(key_buf, event.data.scalar.value, key_len);
+                            if(key_len > 0) memcpy(key_buf, key_text, key_len);
                             key_buf[key_len] = '\0';
-                            yaml_event_delete(&event);
+                            fy_parser_event_free(yp, event);
 
                             /* Read value. */
-                            if(!yaml_parser_parse(&yp, &event)) break;
-                            if(event.type == YAML_SCALAR_EVENT) {
+                            event = fy_parser_parse(yp);
+                            if(event == NULL) break;
+                            if(event->type == FYET_SCALAR) {
+                                size_t val_len = 0;
+                                const char* val_text = fy_token_get_text(event->scalar.value, &val_len);
                                 RENDER_VERBATIM(r, " ");
                                 render_html_escaped(r, key_buf, (MD_SIZE) key_len);
                                 RENDER_VERBATIM(r, "=\"");
-                                render_html_escaped(r, (const char*) event.data.scalar.value,
-                                                    (MD_SIZE) event.data.scalar.length);
+                                if(val_text != NULL)
+                                    render_html_escaped(r, val_text, (MD_SIZE) val_len);
                                 RENDER_VERBATIM(r, "\"");
-                            } else if(event.type == YAML_MAPPING_START_EVENT
-                                      || event.type == YAML_SEQUENCE_START_EVENT) {
+                            } else if(event->type == FYET_MAPPING_START
+                                      || event->type == FYET_SEQUENCE_START) {
                                 /* Skip nested structures. */
                                 int depth = 1;
-                                yaml_event_delete(&event);
-                                while(depth > 0 && yaml_parser_parse(&yp, &event)) {
-                                    if(event.type == YAML_MAPPING_START_EVENT
-                                       || event.type == YAML_SEQUENCE_START_EVENT)
+                                fy_parser_event_free(yp, event);
+                                while(depth > 0 && (event = fy_parser_parse(yp)) != NULL) {
+                                    if(event->type == FYET_MAPPING_START
+                                       || event->type == FYET_SEQUENCE_START)
                                         depth++;
-                                    else if(event.type == YAML_MAPPING_END_EVENT
-                                            || event.type == YAML_SEQUENCE_END_EVENT)
+                                    else if(event->type == FYET_MAPPING_END
+                                            || event->type == FYET_SEQUENCE_END)
                                         depth--;
-                                    yaml_event_delete(&event);
+                                    fy_parser_event_free(yp, event);
                                 }
                                 continue;
                             }
-                            yaml_event_delete(&event);
+                            fy_parser_event_free(yp, event);
                         }
-                    } else {
-                        yaml_event_delete(&event);
+                    } else if(event != NULL) {
+                        fy_parser_event_free(yp, event);
                     }
-                } else {
-                    yaml_event_delete(&event);
+                } else if(event != NULL) {
+                    fy_parser_event_free(yp, event);
                 }
-            } else {
-                yaml_event_delete(&event);
+            } else if(event != NULL) {
+                fy_parser_event_free(yp, event);
             }
-            yaml_parser_delete(&yp);
         }
+        if(yp != NULL)
+            fy_parser_destroy(yp);
     }
 
     RENDER_VERBATIM(r, ">\n");
@@ -867,85 +874,96 @@ static void
 parse_frontmatter_meta(const char* text, MD_SIZE size,
                        char** out_title, char** out_description)
 {
-    yaml_parser_t yp;
-    yaml_event_t event;
+    struct fy_parser* yp;
+    struct fy_event* event;
 
     *out_title = NULL;
     *out_description = NULL;
 
-    if(!yaml_parser_initialize(&yp))
+    yp = fy_parser_create(NULL);
+    if(yp == NULL)
         return;
 
-    yaml_parser_set_input_string(&yp, (const unsigned char*) text, size);
+    if(fy_parser_set_string(yp, text, (size_t) size) != 0) goto done;
 
     /* Consume STREAM_START. */
-    if(!yaml_parser_parse(&yp, &event)) goto done;
-    if(event.type != YAML_STREAM_START_EVENT) { yaml_event_delete(&event); goto done; }
-    yaml_event_delete(&event);
+    event = fy_parser_parse(yp);
+    if(event == NULL) goto done;
+    if(event->type != FYET_STREAM_START) { fy_parser_event_free(yp, event); goto done; }
+    fy_parser_event_free(yp, event);
 
     /* Consume DOCUMENT_START. */
-    if(!yaml_parser_parse(&yp, &event)) goto done;
-    if(event.type != YAML_DOCUMENT_START_EVENT) { yaml_event_delete(&event); goto done; }
-    yaml_event_delete(&event);
+    event = fy_parser_parse(yp);
+    if(event == NULL) goto done;
+    if(event->type != FYET_DOCUMENT_START) { fy_parser_event_free(yp, event); goto done; }
+    fy_parser_event_free(yp, event);
 
     /* Expect top-level MAPPING_START. */
-    if(!yaml_parser_parse(&yp, &event)) goto done;
-    if(event.type != YAML_MAPPING_START_EVENT) { yaml_event_delete(&event); goto done; }
-    yaml_event_delete(&event);
+    event = fy_parser_parse(yp);
+    if(event == NULL) goto done;
+    if(event->type != FYET_MAPPING_START) { fy_parser_event_free(yp, event); goto done; }
+    fy_parser_event_free(yp, event);
 
     /* Iterate top-level key-value pairs. */
     while(1) {
         char** target = NULL;
+        size_t key_len = 0;
+        const char* key_text;
 
-        if(!yaml_parser_parse(&yp, &event)) goto done;
-        if(event.type == YAML_MAPPING_END_EVENT) { yaml_event_delete(&event); break; }
-        if(event.type != YAML_SCALAR_EVENT) { yaml_event_delete(&event); goto done; }
+        event = fy_parser_parse(yp);
+        if(event == NULL) goto done;
+        if(event->type == FYET_MAPPING_END) { fy_parser_event_free(yp, event); break; }
+        if(event->type != FYET_SCALAR) { fy_parser_event_free(yp, event); goto done; }
 
         /* Check if key is "title" or "description". */
-        if(event.data.scalar.length == 5
-           && memcmp(event.data.scalar.value, "title", 5) == 0) {
+        key_text = fy_token_get_text(event->scalar.value, &key_len);
+        if(key_text != NULL && key_len == 5 && memcmp(key_text, "title", 5) == 0) {
             target = out_title;
-        } else if(event.data.scalar.length == 11
-                  && memcmp(event.data.scalar.value, "description", 11) == 0) {
+        } else if(key_text != NULL && key_len == 11
+                  && memcmp(key_text, "description", 11) == 0) {
             target = out_description;
         }
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
 
         /* Read the value. */
-        if(!yaml_parser_parse(&yp, &event)) goto done;
+        event = fy_parser_parse(yp);
+        if(event == NULL) goto done;
 
-        if(target != NULL && event.type == YAML_SCALAR_EVENT
-           && event.data.scalar.length > 0) {
-            size_t len = event.data.scalar.length;
-            char* s = (char*) malloc(len + 1);
-            if(s != NULL) {
-                memcpy(s, event.data.scalar.value, len);
-                s[len] = '\0';
-                free(*target);
-                *target = s;
+        if(target != NULL && event->type == FYET_SCALAR) {
+            size_t len = 0;
+            const char* val_text = fy_token_get_text(event->scalar.value, &len);
+            if(val_text != NULL && len > 0) {
+                char* s = (char*) malloc(len + 1);
+                if(s != NULL) {
+                    memcpy(s, val_text, len);
+                    s[len] = '\0';
+                    free(*target);
+                    *target = s;
+                }
             }
-        } else if(event.type == YAML_MAPPING_START_EVENT
-                  || event.type == YAML_SEQUENCE_START_EVENT) {
+        } else if(event->type == FYET_MAPPING_START
+                  || event->type == FYET_SEQUENCE_START) {
             /* Skip nested structures. */
             int depth = 1;
-            yaml_event_delete(&event);
+            fy_parser_event_free(yp, event);
             while(depth > 0) {
-                if(!yaml_parser_parse(&yp, &event)) goto done;
-                if(event.type == YAML_MAPPING_START_EVENT
-                   || event.type == YAML_SEQUENCE_START_EVENT)
+                event = fy_parser_parse(yp);
+                if(event == NULL) goto done;
+                if(event->type == FYET_MAPPING_START
+                   || event->type == FYET_SEQUENCE_START)
                     depth++;
-                else if(event.type == YAML_MAPPING_END_EVENT
-                        || event.type == YAML_SEQUENCE_END_EVENT)
+                else if(event->type == FYET_MAPPING_END
+                        || event->type == FYET_SEQUENCE_END)
                     depth--;
-                yaml_event_delete(&event);
+                fy_parser_event_free(yp, event);
             }
             continue;
         }
-        yaml_event_delete(&event);
+        fy_parser_event_free(yp, event);
     }
 
 done:
-    yaml_parser_delete(&yp);
+    fy_parser_destroy(yp);
 }
 
 /* Emit the <!DOCTYPE html><html><head>...<body> preamble.
