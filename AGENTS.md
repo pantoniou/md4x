@@ -244,7 +244,14 @@ All extensions are enabled by default (`MD_DIALECT_ALL`). No dialect preset flag
 | `--html-title=TITLE` | Set document title (with `--full-html`) |
 | `--html-css=URL`     | Add CSS link (with `--full-html`)       |
 
-**ANSI output (`--format=ansi`):** Terminal-friendly output with ANSI escape codes for colors, bold, italic, underline, and other text styling.
+**ANSI output options (`--format=ansi`):**
+
+| Option            | Description                                                              |
+| ----------------- | ------------------------------------------------------------------------ |
+| `--color=MODE`    | Color output: `auto` (default; on only when stdout is a TTY), `on`, `off` |
+| `--width=WIDTH`   | Layout width: `auto` (default; `$COLUMNS`/terminal, else 80), `inf` (unlimited), or a column count |
+
+Terminal-friendly output with ANSI escape codes for colors, bold, italic, underline, and other styling. Tables are laid out glow-style (Unicode box separators, aligned columns), and all text is word-wrapped to the width with a 2-column document margin on each side. `--width=inf` disables wrapping. (Long options require `=`, e.g. `--width=80`.)
 
 **JSON output (`--format=json`):** Produces a Comark AST: `{"nodes":[...],"frontmatter":{...},"meta":{}}`. Each node is either a plain string (text) or a tuple array `[tag, props, ...children]`. Frontmatter YAML is parsed into the top-level `frontmatter` object. HTML comments are represented as `[null, {}, "comment body"]`.
 

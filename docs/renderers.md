@@ -108,6 +108,25 @@ int md_ansi(const MD_CHAR* input, MD_SIZE input_size,
             void* userdata, unsigned parser_flags, unsigned renderer_flags);
 ```
 
+Extended API with an explicit layout/wrap width:
+
+```c
+int md_ansi_ex(const MD_CHAR* input, MD_SIZE input_size,
+               void (*process_output)(const MD_CHAR*, MD_SIZE, void*),
+               void* userdata, unsigned parser_flags, unsigned renderer_flags,
+               int width);
+```
+
+The `width` controls table layout and prose word-wrapping:
+
+| `width`                  | Behavior                                                       |
+| ------------------------ | -------------------------------------------------------------- |
+| `> 0`                    | Fixed width (columns).                                         |
+| `MD_ANSI_WIDTH_INF` (`0`) | Unlimited: size tables to content, no wrapping.               |
+| `MD_ANSI_WIDTH_AUTO` (`-1`) | Auto-detect from `$COLUMNS` / terminal (`TIOCGWINSZ`), else 80. |
+
+`md_ansi()` is equivalent to `md_ansi_ex()` with `width = MD_ANSI_WIDTH_AUTO`.
+
 ### Renderer Flags (`MD_ANSI_FLAG_*`)
 
 | Flag                            | Value    | Description                                          |
@@ -127,7 +146,7 @@ int md_ansi(const MD_CHAR* input, MD_SIZE input_size,
 - Underline: underline (`\033[4m`)
 - Strikethrough: strikethrough (`\033[9m`)
 - Inline code: cyan (`\033[36m`)
-- Code blocks: dim (`\033[2m`) with 2-space indent
+- Code blocks: dim (`\033[2m`) with 2-space indent; left preformatted (never wrapped)
 - Links: underline blue (`\033[4;34m`) with OSC 8 clickable hyperlinks
 - Blockquotes: dim vertical bar prefix (`│`)
 - Horizontal rules: box-drawing line (`────────`)
@@ -140,7 +159,16 @@ int md_ansi(const MD_CHAR* input, MD_SIZE input_size,
 - Raw HTML: stripped (not rendered)
 - Entities resolved to UTF-8 characters
 
-Uses streaming renderer pattern (like HTML renderer), no AST construction.
+#### Layout (tables, wrapping, margins)
+
+Modeled on the [glow](https://github.com/charmbracelet/glow) / charmbracelet lipgloss renderer:
+
+- **Tables**: laid out (not tab-separated). Columns are sized to content with Unicode box separators (`│ ┼ ─`), a single header separator, per-column alignment (left/center/right), and a 1-space cell padding. Columns expand to fill the target width, or shrink with word-wrapped cells when too wide.
+- **Word-wrapping**: headings, paragraphs, blockquotes, list items, and table cells are word-wrapped to the target width. Soft breaks reflow to spaces; hard breaks are preserved. `MD_ANSI_WIDTH_INF` disables wrapping.
+- **Margins**: a symmetric 2-column document margin is applied to every line. Blockquotes render as `  │ ` and nest as `  │ │ `.
+- **Display widths**: a Markus-Kuhn-style `wcwidth` table is used — zero-width combining/format marks, East Asian Wide/Fullwidth and most emoji count as 2 columns, everything else (including Greek) as 1. ANSI escape sequences are skipped when measuring. Grapheme clustering is not performed, so ZWJ emoji sequences may measure wider than they render.
+
+Uses a streaming renderer pattern (like the HTML renderer), with per-line buffering only for word-wrapping; tables buffer their cells to lay out columns.
 
 ## Shared JSON Writer (`md4x-json.h`)
 
