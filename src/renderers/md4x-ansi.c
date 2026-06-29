@@ -175,6 +175,17 @@ struct MD_ANSI_tag {
     MD_ANSI_TABLE* table;   /* non-NULL while inside a table block */
     int table_width;        /* >0 fixed, 0 = unlimited, <0 = auto-detect */
 
+    /* Prose word-wrap: content of the current logical line is collected into
+     * lbuf (after its indent prefix), then wrapped to wrap_cols on newline. */
+    int wrap_cols;          /* resolved wrap width in cols; 0 = no wrapping */
+    int wrap_suspend;       /* when set, output bypasses the line buffer */
+    char* lbuf;             /* current line content (after indent) */
+    MD_SIZE lsize, lcap;
+    int line_open;          /* content has been collected on the current line */
+    char indent_buf[256];   /* exact bytes of the current line's indent prefix */
+    MD_SIZE indent_len;
+    int indent_w;           /* display width of indent_buf */
+
     /* Code block metadata tracking (only active when MD_ANSI_FLAG_CODE_META is set) */
     MD_SIZE output_offset;
     MD_ANSI_CODE_META* code_blocks;
@@ -187,7 +198,57 @@ struct MD_ANSI_tag {
  ***  ANSI rendering helper functions  ***
  *********************************************/
 
+/* Forward declarations (definitions live in the table-layout section). */
+typedef struct { MD_SIZE start; MD_SIZE len; int w; } TLINE;
 static void table_cell_append(MD_ANSI_TABLE* t, const MD_CHAR* text, MD_SIZE size);
+
+/* Capture buffer for redirecting output (e.g. to measure the indent prefix). */
+typedef struct {
+    char* buf;
+    MD_SIZE size;
+    MD_SIZE cap;
+} ANSI_CAPTURE_BUF;
+
+static void
+ansi_capture_append(const MD_CHAR* text, MD_SIZE size, void* userdata)
+{
+    ANSI_CAPTURE_BUF* cap = (ANSI_CAPTURE_BUF*) userdata;
+    MD_SIZE n = (cap->size + size <= cap->cap) ? size : (cap->cap - cap->size);
+    if(n > 0) {
+        memcpy(cap->buf + cap->size, text, n);
+        cap->size += n;
+    }
+}
+
+static int ansi_disp_width(const char* buf, MD_SIZE size);
+static TLINE* wrap_text(const char* buf, MD_SIZE size, int width, int* n_out);
+static void render_indent(MD_ANSI* r);
+
+/* Write bytes straight to the output callback (bypassing the line buffer). */
+static void
+out_direct(MD_ANSI* r, const MD_CHAR* text, MD_SIZE size)
+{
+    r->process_output(text, size, r->userdata);
+    if(r->flags & MD_ANSI_FLAG_CODE_META)
+        r->output_offset += size;
+}
+
+/* Append to the current logical line's content buffer (for prose wrapping). */
+static void
+lbuf_append(MD_ANSI* r, const MD_CHAR* text, MD_SIZE size)
+{
+    if(r->lsize + size > r->lcap) {
+        MD_SIZE nc = r->lcap ? r->lcap * 2 : 128;
+        char* p;
+        while(nc < r->lsize + size) nc *= 2;
+        p = (char*) realloc(r->lbuf, nc);
+        if(p == NULL) return;
+        r->lbuf = p;
+        r->lcap = nc;
+    }
+    memcpy(r->lbuf + r->lsize, text, size);
+    r->lsize += size;
+}
 
 static inline void
 render_verbatim(MD_ANSI* r, const MD_CHAR* text, MD_SIZE size)
@@ -197,9 +258,13 @@ render_verbatim(MD_ANSI* r, const MD_CHAR* text, MD_SIZE size)
         table_cell_append(r->table, text, size);
         return;
     }
-    r->process_output(text, size, r->userdata);
-    if(r->flags & MD_ANSI_FLAG_CODE_META)
-        r->output_offset += size;
+    /* When prose wrapping is active, collect the line; flush wraps it later. */
+    if(r->wrap_cols > 0 && !r->wrap_suspend && !r->in_code_block) {
+        lbuf_append(r, text, size);
+        r->line_open = 1;
+        return;
+    }
+    out_direct(r, text, size);
 }
 
 #define RENDER_VERBATIM(r, verbatim)                                    \
@@ -212,8 +277,9 @@ render_ansi(MD_ANSI* r, const char* code)
         RENDER_VERBATIM(r, code);
 }
 
+/* Emit the per-line indent chrome (document margin + quote/alert/list). */
 static void
-render_indent(MD_ANSI* r)
+render_indent_chrome(MD_ANSI* r)
 {
     int i;
     /* Global document left margin, applied to every line (like glow). */
@@ -233,10 +299,70 @@ render_indent(MD_ANSI* r)
     }
 }
 
+/* Start a new line: emit its indent prefix directly and remember it (so wrap
+ * continuation lines can replay the exact same prefix). */
+static void
+render_indent(MD_ANSI* r)
+{
+    ANSI_CAPTURE_BUF cap;
+    void (*saved_out)(const MD_CHAR*, MD_SIZE, void*) = r->process_output;
+    void* saved_ud = r->userdata;
+    MD_ANSI_TABLE* saved_table = r->table;
+    int saved_suspend = r->wrap_suspend;
+
+    cap.buf = r->indent_buf;
+    cap.size = 0;
+    cap.cap = sizeof(r->indent_buf);
+
+    /* Capture the prefix bytes (without disturbing real output / wrapping). */
+    r->process_output = ansi_capture_append;
+    r->userdata = &cap;
+    r->table = NULL;
+    r->wrap_suspend = 1;
+    render_indent_chrome(r);
+    r->process_output = saved_out;
+    r->userdata = saved_ud;
+    r->table = saved_table;
+    r->wrap_suspend = saved_suspend;
+
+    r->indent_len = cap.size;
+    r->indent_w = ansi_disp_width(r->indent_buf, cap.size);
+    out_direct(r, r->indent_buf, r->indent_len);
+}
+
+/* Wrap the collected line content to the available width and emit it. */
+static void
+flush_wrapped(MD_ANSI* r)
+{
+    int avail = r->wrap_cols - r->indent_w;
+    int n = 0, k;
+    TLINE* lines;
+
+    if(avail < 1) avail = 1;
+    lines = wrap_text(r->lbuf, r->lsize, avail, &n);
+
+    for(k = 0; k < n; k++) {
+        if(k > 0) {
+            out_direct(r, "\n", 1);
+            out_direct(r, r->indent_buf, r->indent_len);  /* replay prefix */
+        }
+        if(lines[k].len > 0)
+            out_direct(r, r->lbuf + lines[k].start, lines[k].len);
+    }
+    out_direct(r, "\n", 1);
+
+    free(lines);
+    r->lsize = 0;
+    r->line_open = 0;
+}
+
 static void
 render_newline(MD_ANSI* r)
 {
-    RENDER_VERBATIM(r, "\n");
+    if(r->wrap_cols > 0 && !r->wrap_suspend && !r->in_code_block && r->line_open)
+        flush_wrapped(r);
+    else
+        out_direct(r, "\n", 1);
 }
 
 /* Render a blank separator line with alert bar prefix when inside an alert. */
@@ -423,23 +549,6 @@ ansi_code_meta_cleanup(MD_ANSI* r)
     }
 }
 
-/* Capture buffer for redirecting output to capture the indent prefix. */
-typedef struct {
-    char* buf;
-    MD_SIZE size;
-    MD_SIZE cap;
-} ANSI_CAPTURE_BUF;
-
-static void
-ansi_capture_append(const MD_CHAR* text, MD_SIZE size, void* userdata)
-{
-    ANSI_CAPTURE_BUF* cap = (ANSI_CAPTURE_BUF*) userdata;
-    MD_SIZE n = (cap->size + size <= cap->cap) ? size : (cap->cap - cap->size);
-    if(n > 0) {
-        memcpy(cap->buf + cap->size, text, n);
-        cap->size += n;
-    }
-}
 
 static void
 ansi_emit_json_str(void (*out)(const MD_CHAR*, MD_SIZE, void*), void* ud,
@@ -848,6 +957,7 @@ ansi_indent_width(MD_ANSI* r)
     void (*saved_out)(const MD_CHAR*, MD_SIZE, void*) = r->process_output;
     void* saved_ud = r->userdata;
     MD_ANSI_TABLE* saved_table = r->table;
+    int saved_suspend = r->wrap_suspend;
     int w;
 
     cap.buf = buf;
@@ -855,12 +965,14 @@ ansi_indent_width(MD_ANSI* r)
     cap.cap = sizeof(buf);
 
     r->table = NULL;                 /* prevent cell-capture redirect */
+    r->wrap_suspend = 1;             /* prevent line-buffer redirect */
     r->process_output = ansi_capture_append;
     r->userdata = &cap;
-    render_indent(r);
+    render_indent_chrome(r);
     r->process_output = saved_out;
     r->userdata = saved_ud;
     r->table = saved_table;
+    r->wrap_suspend = saved_suspend;
 
     w = ansi_disp_width(buf, cap.size);
     return w;
@@ -873,21 +985,15 @@ tbl_spaces(MD_ANSI* r, int n)
         RENDER_VERBATIM(r, " ");
 }
 
-/* One wrapped physical line within a cell: a byte slice and its display width. */
-typedef struct { MD_SIZE start; MD_SIZE len; int w; } TLINE;
-
-/* Greedy word-wrap of a cell's content to `width` display columns, like glow.
- * Returns a malloc'd array of line slices into the cell buffer (count in
- * *n_out); the caller frees it. ANSI escapes are zero-width and stay attached
- * to the line they appear in. Always returns at least one (possibly empty)
- * line. */
+/* Greedy word-wrap of a UTF-8 buffer to `width` display columns, like glow.
+ * Returns a malloc'd array of line slices into `buf` (count in *n_out); the
+ * caller frees it. ANSI escapes are zero-width and stay attached to the line
+ * they appear in. Always returns at least one (possibly empty) line. */
 static TLINE*
-table_wrap_cell(const MD_ANSI_TCELL* cell, int width, int* n_out)
+wrap_text(const char* buf, MD_SIZE size, int width, int* n_out)
 {
     TLINE* lines = NULL;
     int n = 0, cap = 0;
-    const char* buf = (cell != NULL) ? cell->buf : NULL;
-    MD_SIZE size = (cell != NULL) ? cell->size : 0;
     MD_SIZE i = 0, line_start = 0, last_space = (MD_SIZE) -1;
     int line_w = 0, w_at_space = 0;
 
@@ -991,7 +1097,8 @@ table_emit_row(MD_ANSI* r, MD_ANSI_TROW* row, const int* widths, int n_cols)
     for(j = 0; j < n_cols; j++) {
         const MD_ANSI_TCELL* cell = (j < row->n_cells) ? &row->cells[j] : NULL;
         bufs[j] = (cell != NULL) ? cell->buf : NULL;
-        wrapped[j] = table_wrap_cell(cell, widths[j], &nlines[j]);
+        wrapped[j] = wrap_text(bufs[j], (cell != NULL) ? cell->size : 0,
+                               widths[j], &nlines[j]);
         if(nlines[j] > height) height = nlines[j];
     }
 
@@ -1107,16 +1214,24 @@ table_emit(MD_ANSI* r)
         }
     }
 
-    for(i = 0; i < t->n_rows; i++) {
-        MD_ANSI_TROW* row = &t->rows[i];
-        if(!row->is_header && any_header && !emitted_sep) {
-            table_emit_separator(r, widths, n_cols);
-            emitted_sep = 1;
+    /* The table emits its own pre-wrapped lines; bypass prose line wrapping. */
+    {
+        int saved_suspend = r->wrap_suspend;
+        r->wrap_suspend = 1;
+
+        for(i = 0; i < t->n_rows; i++) {
+            MD_ANSI_TROW* row = &t->rows[i];
+            if(!row->is_header && any_header && !emitted_sep) {
+                table_emit_separator(r, widths, n_cols);
+                emitted_sep = 1;
+            }
+            table_emit_row(r, row, widths, n_cols);
         }
-        table_emit_row(r, row, widths, n_cols);
+        if(any_header && !emitted_sep)
+            table_emit_separator(r, widths, n_cols);
+
+        r->wrap_suspend = saved_suspend;
     }
-    if(any_header && !emitted_sep)
-        table_emit_separator(r, widths, n_cols);
 
     free(widths);
 }
@@ -1643,11 +1758,15 @@ text_callback(MD_TEXTTYPE type, const MD_CHAR* text, MD_SIZE size, void* userdat
             break;
 
         case MD_TEXT_SOFTBR:
-            if(r->image_nesting_level == 0) {
+            if(r->image_nesting_level != 0) {
+                RENDER_VERBATIM(r, " ");
+            } else if(r->wrap_cols > 0 && !r->in_code_block) {
+                /* When wrapping, a soft break becomes a space so the whole
+                 * paragraph reflows to the target width (like glow). */
+                RENDER_VERBATIM(r, " ");
+            } else {
                 render_newline(r);
                 render_indent(r);
-            } else {
-                RENDER_VERBATIM(r, " ");
             }
             break;
 
@@ -1743,6 +1862,13 @@ md_ansi_ex(const MD_CHAR* input, MD_SIZE input_size,
     render.userdata = userdata;
     render.flags = renderer_flags;
     render.table_width = width;
+    /* Resolve the prose wrap width: fixed, auto-detected, or 0 (no wrap). */
+    if(width == MD_ANSI_WIDTH_INF)
+        render.wrap_cols = 0;
+    else if(width > 0)
+        render.wrap_cols = width;
+    else
+        render.wrap_cols = table_term_width();
 
     /* Consider skipping UTF-8 byte order mark (BOM). */
     if(renderer_flags & MD_ANSI_FLAG_SKIP_UTF8_BOM  &&  sizeof(MD_CHAR) == 1) {
@@ -1761,6 +1887,11 @@ md_ansi_ex(const MD_CHAR* input, MD_SIZE input_size,
                 render_ansi_code_meta_json(&render);
             ansi_code_meta_cleanup(&render);
         }
+
+        /* Flush any line still buffered by the wrapper. */
+        if(render.line_open)
+            flush_wrapped(&render);
+        free(render.lbuf);
 
         /* Free any table left dangling by an aborted parse. */
         if(render.table != NULL)
