@@ -286,7 +286,7 @@ render_indent_chrome(MD_ANSI* r)
     RENDER_VERBATIM(r, "  ");
     for(i = 0; i < r->quote_depth; i++) {
         render_ansi(r, ANSI_DIM);
-        RENDER_VERBATIM(r, "  " QUOTE_BAR " ");
+        RENDER_VERBATIM(r, QUOTE_BAR " ");
         render_ansi(r, ANSI_DIM_OFF);
     }
     if(r->in_alert && r->alert_color) {
