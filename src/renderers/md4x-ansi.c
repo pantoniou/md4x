@@ -104,6 +104,7 @@
 #define TBL_HORIZ           "\xe2\x94\x80"  /* ─ U+2500 */
 #define TBL_CROSS           "\xe2\x94\xbc"  /* ┼ U+253C */
 #define TBL_ELLIPSIS        "\xe2\x80\xa6"  /* … U+2026 */
+#define TBL_MARGIN          2               /* document margin (cols, each side) */
 
 /* Blockquote bar (UTF-8: vertical bar U+2502) */
 #define QUOTE_BAR           "\xe2\x94\x82"
@@ -914,10 +915,19 @@ table_emit_cell(MD_ANSI* r, const MD_ANSI_TCELL* cell, int width,
 }
 
 static void
+tbl_spaces(MD_ANSI* r, int n)
+{
+    while(n-- > 0)
+        RENDER_VERBATIM(r, " ");
+}
+
+static void
 table_emit_row(MD_ANSI* r, MD_ANSI_TROW* row, const int* widths, int n_cols)
 {
     int j;
     render_indent(r);
+    tbl_spaces(r, TBL_MARGIN);
+    RENDER_VERBATIM(r, " ");                 /* outer left cell padding */
     for(j = 0; j < n_cols; j++) {
         const MD_ANSI_TCELL* cell = (j < row->n_cells) ? &row->cells[j] : NULL;
         MD_ALIGN align = (j < r->table->n_aligns) ? r->table->aligns[j] : MD_ALIGN_DEFAULT;
@@ -925,6 +935,7 @@ table_emit_row(MD_ANSI* r, MD_ANSI_TROW* row, const int* widths, int n_cols)
             RENDER_VERBATIM(r, " " TBL_VERT " ");
         table_emit_cell(r, cell, widths[j], align, row->is_header);
     }
+    RENDER_VERBATIM(r, " ");                 /* outer right cell padding */
     render_newline(r);
 }
 
@@ -933,12 +944,15 @@ table_emit_separator(MD_ANSI* r, const int* widths, int n_cols)
 {
     int j, k;
     render_indent(r);
+    tbl_spaces(r, TBL_MARGIN);
+    RENDER_VERBATIM(r, TBL_HORIZ);           /* under outer left padding */
     for(j = 0; j < n_cols; j++) {
         if(j > 0)
             RENDER_VERBATIM(r, TBL_HORIZ TBL_CROSS TBL_HORIZ);
         for(k = 0; k < widths[j]; k++)
             RENDER_VERBATIM(r, TBL_HORIZ);
     }
+    RENDER_VERBATIM(r, TBL_HORIZ);           /* under outer right padding */
     render_newline(r);
 }
 
@@ -949,7 +963,7 @@ table_emit(MD_ANSI* r)
     MD_ANSI_TABLE* t = r->table;
     int n_cols = 0, i, j;
     int* widths;
-    int indent_w, avail, total;
+    int indent_w, total = 0;
     int any_header = 0, emitted_sep = 0;
 
     if(t == NULL)
@@ -975,27 +989,43 @@ table_emit(MD_ANSI* r)
         }
     }
 
-    /* Fit to width. Column separators add 3 cols (" │ ") per gap.
-     * Width mode: >0 fixed, 0 unlimited (no shrink), <0 auto-detect. */
+    /* Fit columns to a target width (like glow): shrink the widest columns
+     * when too wide, expand the narrowest to fill when too narrow.
+     *
+     * Non-content overhead per line = document margin + the two outer cell
+     * paddings + the " │ " gaps (3 cols each). Width mode: >0 fixed,
+     * INF(0) = unlimited (natural widths), <0 = auto-detect. */
     indent_w = ansi_indent_width(r);
-    if(r->table_width > 0)
-        avail = r->table_width - indent_w;
-    else if(r->table_width == MD_ANSI_WIDTH_INF)
-        avail = INT_MAX;
-    else
-        avail = table_term_width() - indent_w;
-    if(avail < n_cols) avail = n_cols;
 
-    total = 3 * (n_cols - 1);
-    for(j = 0; j < n_cols; j++) total += widths[j];
+    if(r->table_width != MD_ANSI_WIDTH_INF) {
+        int wtarget = (r->table_width > 0) ? r->table_width : table_term_width();
+        int overhead = TBL_MARGIN + 2 + 3 * (n_cols - 1);
+        int content_avail = wtarget - indent_w - overhead;
+        if(content_avail < n_cols) content_avail = n_cols;  /* >= 1 col each */
 
-    while(total > avail) {
-        int wi = 0;
-        for(j = 1; j < n_cols; j++)
-            if(widths[j] > widths[wi]) wi = j;
-        if(widths[wi] <= 1) break;
-        widths[wi]--;
-        total--;
+        total = 0;
+        for(j = 0; j < n_cols; j++) {
+            if(widths[j] < 1) widths[j] = 1;
+            total += widths[j];
+        }
+
+        /* Shrink the widest column until it fits. */
+        while(total > content_avail) {
+            int wi = 0;
+            for(j = 1; j < n_cols; j++)
+                if(widths[j] > widths[wi]) wi = j;
+            if(widths[wi] <= 1) break;
+            widths[wi]--;
+            total--;
+        }
+        /* Expand the narrowest column to fill the remaining width. */
+        while(total < content_avail) {
+            int wi = 0;
+            for(j = 1; j < n_cols; j++)
+                if(widths[j] < widths[wi]) wi = j;
+            widths[wi]++;
+            total++;
+        }
     }
 
     for(i = 0; i < t->n_rows; i++) {
