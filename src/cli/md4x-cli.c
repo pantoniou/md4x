@@ -81,7 +81,8 @@ static int ansi_width = MD_ANSI_WIDTH_AUTO; /* >0 fixed, 0 inf, <0 auto */
 
 /* Streaming (push) mode for ANSI output. */
 static int want_stream = 0;
-static int stream_chunk = 0;    /* push chunk size; 0 => default (undocumented override) */
+static int stream_chunk = 0;        /* push chunk size; 0 => default (undocumented override) */
+static int want_stream_progressive = 0; /* drive md4x_stream_render(); reconstruct screen */
 
 static const char* html_title = NULL;
 static const char* css_path = NULL;
@@ -275,6 +276,34 @@ process_file(const char* in_path, FILE* in, FILE* out)
                 if(s == NULL) { ret = -1; break; }
 
                 ret = 0;
+                if(want_stream_progressive) {
+                    /* Drive md4x_stream_render() and reconstruct the screen by
+                     * applying each {backtrack, content} update; print the final
+                     * screen (must match the one-shot render). */
+                    for(off = 0; off < buf_in.size; off += chunk) {
+                        MD4X_STREAM_UPDATE upd;
+                        size_t clen = buf_in.size - off;
+                        if(clen > chunk) clen = chunk;
+                        if(md4x_stream_render(s, buf_in.data + off, clen, &upd) != 0) {
+                            ret = -1;
+                            break;
+                        }
+                        /* Erase upd.backtrack trailing lines from buf_out. */
+                        {
+                            size_t pos = buf_out.size, k;
+                            for(k = 0; k < upd.backtrack && pos > 0; k++) {
+                                pos--;
+                                while(pos > 0 && buf_out.data[pos - 1] != '\n') pos--;
+                            }
+                            buf_out.size = pos;
+                        }
+                        if(upd.content_len > 0)
+                            membuf_append(&buf_out, upd.content, (MD_SIZE) upd.content_len);
+                    }
+                    md4x_stream_destroy(s);
+                    break;
+                }
+
                 for(off = 0; off < buf_in.size; off += chunk) {
                     size_t clen = buf_in.size - off;
                     if(clen > chunk) clen = chunk;
@@ -370,6 +399,9 @@ static const CMDLINE_OPTION cmdline_options[] = {
 
     /* Undocumented: override the streaming push chunk size (for tests). */
     {  0,  "stream-chunk",                  '8', CMDLINE_OPTFLAG_REQUIREDARG },
+
+    /* Undocumented: drive md4x_stream_render() and reconstruct the screen. */
+    {  0,  "stream-progressive",            '9', 0 },
 
     {  0,  "html-title",                    '1', CMDLINE_OPTFLAG_REQUIREDARG },
     {  0,  "html-css",                      '2', CMDLINE_OPTFLAG_REQUIREDARG },
@@ -474,6 +506,7 @@ cmdline_callback(int opt, char const* value, void* data)
             break;
 
         case '7':   want_stream = 1; break;
+        case '9':   want_stream = 1; want_stream_progressive = 1; break;
         case '8':   /* --stream-chunk=<n> (undocumented) */
             stream_chunk = atoi(value);
             if(stream_chunk < 1) {

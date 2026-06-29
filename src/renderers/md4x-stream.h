@@ -105,6 +105,37 @@ extern "C"
      * context. *out / *out_len are context-owned. Returns 0 / -1. */
     int md4x_stream_finish(MD4X_STREAM* s, const char** out, size_t* out_len);
 
+    /* Progressive line-diff update produced by md4x_stream_render().
+     *
+     * The active region (everything below the last committed line) is re-rendered
+     * and diffed against the previous render line by line. Apply it to a virtual
+     * terminal as: move the cursor up `backtrack` lines, clear to end of screen,
+     * then print `content`. Usually only the last line or two change, so
+     * `backtrack` is small; a table reflow may change the whole active region.
+     *
+     *   backtrack    Number of trailing active-region lines to erase upward.
+     *   content      Replacement text to print at that point (newline-terminated
+     *                lines); context-owned, valid until the next call.
+     *   freeze       After applying, this many lines at the TOP of the active
+     *                region have reached a safe sync point and are now permanent
+     *                (they will never be backtracked into again). Informational —
+     *                future updates' `backtrack` never exceeds the still-mutable
+     *                line count.
+     */
+    typedef struct MD4X_STREAM_UPDATE {
+        size_t backtrack;
+        const char* content;
+        size_t content_len;
+        size_t freeze;
+    } MD4X_STREAM_UPDATE;
+
+    /* Append input and produce a progressive update for the active region (the
+     * region after the last safe sync point). The active region is rendered
+     * unhealed, so what is displayed matches the final committed output and a
+     * line only changes when its source does. Returns 0 / -1. */
+    int md4x_stream_render(MD4X_STREAM* s, const char* chunk, size_t len,
+                           MD4X_STREAM_UPDATE* upd);
+
 #ifdef __cplusplus
 } /* extern "C" { */
 #endif

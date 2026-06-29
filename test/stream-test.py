@@ -52,20 +52,24 @@ def main():
     failed = 0
 
     # Core invariant: the committed stream is the true (unhealed) render, so
-    # streamed output must be byte-identical to the one-shot render.
+    # streamed output must be byte-identical to the one-shot render. Checked for
+    # both the append-only push mode (--stream) and the progressive line-diff
+    # mode (--stream-progressive, whose updates are applied to a virtual screen
+    # by the CLI and the final screen printed).
     for name, text in FIXTURES.items():
         for w in WIDTHS:
             base = run(opts.program, text, ["--width=%d" % w])
             for chunk in CHUNKS:
-                got = run(opts.program, text,
-                          ["--width=%d" % w, "--stream", "--stream-chunk=%d" % chunk])
-                if got == base:
-                    passed += 1
-                else:
-                    failed += 1
-                    print("FAIL %s width=%d chunk=%d" % (name, w, chunk))
-                    print("  one-shot: %r" % base[:200])
-                    print("  stream:   %r" % got[:200])
+                for mode in ("--stream", "--stream-progressive"):
+                    got = run(opts.program, text,
+                              ["--width=%d" % w, mode, "--stream-chunk=%d" % chunk])
+                    if got == base:
+                        passed += 1
+                    else:
+                        failed += 1
+                        print("FAIL %s %s width=%d chunk=%d" % (name, mode, w, chunk))
+                        print("  one-shot: %r" % base[:200])
+                        print("  stream:   %r" % got[:200])
 
     # Heal smoke test: a stream cut off mid-emphasis. With --heal the trailing
     # marker is closed (bold applied, no literal "**" left); without it the

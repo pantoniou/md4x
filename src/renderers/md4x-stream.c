@@ -105,6 +105,7 @@ struct MD4X_STREAM {
     STREAM_BUF tail;      /* render of accum[anchor:] (active region) */
     STREAM_BUF seg;       /* render of a candidate committed segment */
     STREAM_BUF out;       /* slice returned to the caller (committed/preview/finish) */
+    STREAM_BUF shown;     /* active region currently displayed (for md4x_stream_render) */
     size_t anchor;        /* input offset of the last confirmed sync point */
     int emitted;          /* non-zero once any committed output has been returned */
     int finished;
@@ -233,6 +234,7 @@ md4x_stream_create(const MD4X_STREAM_OPTS* opts)
     sbuf_init(&s->tail);
     sbuf_init(&s->seg);
     sbuf_init(&s->out);
+    sbuf_init(&s->shown);
     s->anchor = 0;
     s->emitted = 0;
     s->finished = 0;
@@ -248,6 +250,7 @@ md4x_stream_destroy(MD4X_STREAM* s)
     sbuf_fini(&s->tail);
     sbuf_fini(&s->seg);
     sbuf_fini(&s->out);
+    sbuf_fini(&s->shown);
     free(s);
 }
 
@@ -351,5 +354,94 @@ md4x_stream_finish(MD4X_STREAM* s, const char** out, size_t* out_len)
 
     if(out) *out = s->out.data;
     if(out_len) *out_len = s->out.size;
+    return 0;
+}
+
+/* Number of '\n' characters in [data, data+size). */
+static size_t
+count_lines(const char* data, size_t size)
+{
+    size_t i, n = 0;
+    for(i = 0; i < size; i++)
+        if(data[i] == '\n') n++;
+    return n;
+}
+
+/* Byte offset just past the longest common run of whole lines of `a` and `b`. */
+static size_t
+common_line_prefix(const STREAM_BUF* a, const STREAM_BUF* b)
+{
+    size_t n = (a->size < b->size) ? a->size : b->size;
+    size_t i = 0, line_start = 0;
+    while(i < n && a->data[i] == b->data[i]) {
+        if(a->data[i] == '\n') line_start = i + 1;
+        i++;
+    }
+    return line_start;
+}
+
+int
+md4x_stream_render(MD4X_STREAM* s, const char* chunk, size_t len,
+                   MD4X_STREAM_UPDATE* upd)
+{
+    size_t line_start, sync, freeze_bytes = 0;
+
+    if(upd != NULL) {
+        upd->backtrack = 0;
+        upd->content = NULL;
+        upd->content_len = 0;
+        upd->freeze = 0;
+    }
+    if(s == NULL || s->finished || upd == NULL)
+        return -1;
+
+    if(len > 0 && sbuf_append(&s->accum, chunk, len) != 0)
+        return -1;
+
+    /* Render the active region (unhealed: what is shown equals the committed
+     * truth, so a line only changes when its source does) into the scratch
+     * buffer s->out, then compose s->tail = leading inter-block separator (a
+     * blank line, present once anything has been committed above) + that render.
+     * The separator is what joins the active region to the committed output. */
+    if(stream_render(s, &s->out, s->accum.data + s->anchor,
+                     s->accum.size - s->anchor, 0) != 0)
+        return -1;
+    sbuf_reset(&s->tail);
+    if(s->emitted && sbuf_append(&s->tail, "\n", 1) != 0)
+        return -1;
+    if(sbuf_append(&s->tail, s->out.data, s->out.size) != 0)
+        return -1;
+
+    /* Diff against what is currently displayed: keep the common leading lines,
+     * backtrack over the rest, and re-emit from the first changed line. */
+    line_start = common_line_prefix(&s->shown, &s->tail);
+    upd->backtrack = count_lines(s->shown.data + line_start, s->shown.size - line_start);
+    upd->content = s->tail.data + line_start;
+    upd->content_len = s->tail.size - line_start;
+
+    /* Advance the commit anchor to the furthest verified safe sync point; the
+     * lines up to it (including the leading separator) become permanent
+     * (reported via freeze) and drop out of the mutable active region. */
+    sync = next_sync_offset(s->accum.data, s->accum.size, s->anchor);
+    if(sync > s->anchor) {
+        size_t sep = s->emitted ? 1 : 0;
+        if(stream_render(s, &s->seg, s->accum.data + s->anchor,
+                         sync - s->anchor, 0) != 0)
+            return -1;
+        if(s->seg.size <= s->out.size
+           && memcmp(s->seg.data, s->out.data, s->seg.size) == 0) {
+            freeze_bytes = sep + s->seg.size;
+            upd->freeze = count_lines(s->tail.data, freeze_bytes);
+            s->anchor = sync;
+            s->emitted = 1;
+        }
+    }
+
+    /* Remember the now-displayed active region (minus the frozen prefix). */
+    sbuf_reset(&s->shown);
+    if(sbuf_append(&s->shown, s->tail.data + freeze_bytes,
+                   s->tail.size - freeze_bytes) != 0)
+        return -1;
+
     return 0;
 }

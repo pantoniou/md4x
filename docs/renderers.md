@@ -205,6 +205,23 @@ The Markdown parser is one-shot, so the context renders via `md_ansi_ex()`. The 
 
 Because only the active region is re-rendered (not the whole document), work stays bounded as the anchor advances.
 
+### Progressive updates (`md4x_stream_render`)
+
+For a terminal that updates the active region in place, `md4x_stream_render()` returns a line-diff instead of append-only output:
+
+```c
+typedef struct MD4X_STREAM_UPDATE {
+    size_t backtrack;     /* trailing active-region lines to erase upward */
+    const char* content;  /* replacement text to print (newline-terminated lines) */
+    size_t content_len;
+    size_t freeze;        /* lines at the top of the active region now permanent */
+} MD4X_STREAM_UPDATE;
+
+int md4x_stream_render(MD4X_STREAM* s, const char* chunk, size_t len, MD4X_STREAM_UPDATE* upd);
+```
+
+Each call appends input, re-renders the active region **unhealed** (so what is displayed equals the committed truth), and diffs it against the previous render line by line. Apply the update to a virtual terminal as: move the cursor up `backtrack` lines, clear to end of screen, then print `content`. Usually only the last line or two change (small `backtrack`); a table reflow may change the whole active region. `freeze` reports how many top lines just reached a safe sync point and are now permanent (future `backtrack` never exceeds the still-mutable line count). Applying every update to a virtual screen reconstructs exactly the one-shot render.
+
 **Guarantee / caveat:** with healing off, the concatenation of all committed pushes plus `finish` is byte-identical to a one-shot `md_ansi`/`md_ansi_ex` render of the same input. The one theoretical exception is a CommonMark link reference definition appearing later in the stream, which can change how an earlier link rendered; such retroactive changes are not applied to already-committed output. Healing is a whole-document transform, so it is used only for `preview`/`finish`, not for committed output.
 
 The `md4x` CLI exposes this via `--format=ansi --stream` (see [CLI docs](../AGENTS.md)).
