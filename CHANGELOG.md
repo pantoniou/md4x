@@ -13,6 +13,7 @@
 
 ### ANSI renderer
 
+- **Streaming / push API (`md4x_stream_*`)**: A push-mode front-end for the ANSI renderer (`md4x-stream.h`), for live terminal output. Create a context, push input chunks, and get back output that is safe to commit, plus `preview()` (healed render of the active region) and `finish()`. It commits up to the last "safe sync point" — a blank line where all block containers are closed — and re-renders only the active region since that point, so work stays bounded. With healing off, the streamed output is byte-identical to a one-shot render. Exposed on the CLI as `--format=ansi --stream`. New `md_ansi_detect_width()` pins the auto width once.
 - **Glow-style table rendering**: Tables are now laid out instead of tab-separated. Columns are sized to content with Unicode box separators (`│ ┼ ─`), a single header separator, per-column alignment (left/center/right), and a 1-space cell padding. Columns expand to fill the target width or shrink (with word-wrapped cells) when too wide. Modeled on the [glow](https://github.com/charmbracelet/glow) / charmbracelet lipgloss table renderer.
 - **Word-wrapping**: All output (headings, paragraphs, blockquotes, list items, and table cells) is word-wrapped to the target width; soft breaks reflow, hard breaks are preserved, and code blocks are left preformatted. `--width=inf` disables wrapping.
 - **Document margins**: A symmetric 2-column document margin is applied to every line (matching glow). Blockquotes render as `  │ ` (no double padding) and nest as `  │ │ `.

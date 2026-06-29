@@ -134,6 +134,10 @@ Color output: \fBauto\fR (default; enabled only when stdout is a terminal), \fBo
 .B --width= \fIWIDTH\fR
 Layout width: \fBauto\fR (default; from \fB$COLUMNS\fR or the terminal, else 80), \fBinf\fR (unlimited, no wrapping), or a column count. Tables are laid out and all text is word-wrapped to this width.
 .
+.TP
+.B --stream
+Render incrementally (push mode): output is emitted as input arrives, committed up to the last safe sync point. With healing off, the result is identical to a non-streamed ANSI render.
+.
 .SH SEE ALSO
 .
 https://github.com/unjs/md4x

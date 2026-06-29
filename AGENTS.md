@@ -38,6 +38,8 @@ src/
     md4x-text.h        # Plain text renderer public API
     md4x-markdown.c    # Markdown renderer library (~820 LoC)
     md4x-markdown.h    # Markdown renderer public API
+    md4x-stream.c      # Streaming/push front-end for the ANSI renderer (~330 LoC)
+    md4x-stream.h      # Streaming/push public API
     md4x-heal.c        # Markdown heal/completion utility (~600 LoC)
     md4x-heal.h        # Heal utility public API
   cli/
@@ -72,6 +74,7 @@ test/
   coverage.txt         # Code coverage tests
   run-testsuite.py     # Individual test suite runner
   pathological-tests.py # Stress tests for DoS resistance
+  stream-test.py       # Streaming (--stream) vs one-shot equality test
   prog.py              # Program execution wrapper
   normalize.py         # HTML normalization for comparison
   fuzzers/             # LibFuzzer harnesses (html, ast, ansi, text, meta, heal)
@@ -147,6 +150,7 @@ Produces four static libraries, one executable, and optional WASM/NAPI targets:
 - **libmd4x-meta** — Meta renderer (links against libmd4x)
 - **libmd4x-text** — Plain text renderer (links against libmd4x)
 - **libmd4x-markdown** — Markdown renderer (links against libmd4x)
+- **libmd4x-stream** — Streaming/push front-end for the ANSI renderer (links against libmd4x-ansi)
 - **libmd4x-heal** — Markdown heal/completion utility (standalone, no parser dependency)
 - **md4x** — CLI utility (supports `--format=html|text|json|ansi|markdown|heal`)
 - **md4x.wasm** — WASM library (`zig build wasm`, output: `packages/md4x/build/md4x.wasm`)
@@ -250,8 +254,11 @@ All extensions are enabled by default (`MD_DIALECT_ALL`). No dialect preset flag
 | ----------------- | ------------------------------------------------------------------------ |
 | `--color=MODE`    | Color output: `auto` (default; on only when stdout is a TTY), `on`, `off` |
 | `--width=WIDTH`   | Layout width: `auto` (default; `$COLUMNS`/terminal, else 80), `inf` (unlimited), or a column count |
+| `--stream`        | Render incrementally (push mode); emits stable output as input arrives    |
 
 Terminal-friendly output with ANSI escape codes for colors, bold, italic, underline, and other styling. Tables are laid out glow-style (Unicode box separators, aligned columns), and all text is word-wrapped to the width with a 2-column document margin on each side. `--width=inf` disables wrapping. (Long options require `=`, e.g. `--width=80`.)
+
+`--stream` uses the push/streaming API (`md4x_stream_*`, see [docs/renderers.md](docs/renderers.md)): output is committed up to the last "safe sync point" (a blank line where all block containers are closed) so only the active region is re-rendered. With healing off, the streamed output is byte-identical to a one-shot `--format=ansi` render.
 
 **JSON output (`--format=json`):** Produces a Comark AST: `{"nodes":[...],"frontmatter":{...},"meta":{}}`. Each node is either a plain string (text) or a tuple array `[tag, props, ...children]`. Frontmatter YAML is parsed into the top-level `frontmatter` object. HTML comments are represented as `[null, {}, "comment body"]`.
 

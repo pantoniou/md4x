@@ -170,6 +170,45 @@ Modeled on the [glow](https://github.com/charmbracelet/glow) / charmbracelet lip
 
 Uses a streaming renderer pattern (like the HTML renderer), with per-line buffering only for word-wrapping; tables buffer their cells to lay out columns.
 
+## Streaming / Push API (`md4x-stream.h`)
+
+A push-mode front-end for the ANSI renderer, aimed at live terminal output (e.g. streaming LLM responses). Instead of one callback over the whole document, the caller creates a context and pushes input chunks; each push returns the output that is now safe to commit.
+
+```c
+typedef struct MD4X_STREAM MD4X_STREAM;
+
+typedef struct MD4X_STREAM_OPTS {
+    unsigned parser_flags;   /* 0 => MD_DIALECT_ALL */
+    unsigned renderer_flags; /* MD_ANSI_FLAG_* (e.g. NO_COLOR); HEAL is managed internally */
+    int      width;          /* MD_ANSI_WIDTH_AUTO / _INF / fixed columns */
+    int      heal;           /* non-zero: preview()/finish() close dangling markers */
+} MD4X_STREAM_OPTS;
+
+MD4X_STREAM* md4x_stream_create(const MD4X_STREAM_OPTS* opts);  /* NULL = defaults */
+void         md4x_stream_destroy(MD4X_STREAM* s);
+
+int md4x_stream_push(MD4X_STREAM* s, const char* chunk, size_t len,
+                     const char** out, size_t* out_len);   /* committed output */
+int md4x_stream_preview(MD4X_STREAM* s, const char** out, size_t* out_len); /* healed active region */
+int md4x_stream_finish(MD4X_STREAM* s, const char** out, size_t* out_len);  /* final remainder */
+```
+
+All functions return 0 / -1 (allocation failure). Returned pointers are owned by the context and remain valid only until the next call on it.
+
+### How it works
+
+The Markdown parser is one-shot, so the context renders via `md_ansi_ex()`. The key is the **safe sync point**: a blank line at which all block containers are closed — top level, not inside a fenced code block, and followed by a complete next line that starts a new block at column 0 and is **not** a list item. At such a point the renderer is in its initial state, so the text after it renders standalone byte-for-byte identically to the tail of a full render.
+
+- **`push`** appends the chunk, re-renders only the **active region** (since the last sync point), advances the anchor to the furthest new safe sync point, and commits the segment between the old and new anchor. The segment is verified (its standalone render must be a true byte-prefix of the active-region render) before committing, so loose lists, tables, setext headings, etc. are never mis-committed. Committed segments are joined by the inter-block newline separator.
+- **`preview`** returns a healed render of the active region (for redrawing the in-progress tail each frame).
+- **`finish`** renders and returns the remaining active region (optionally healed to close dangling markers from a truncated stream).
+
+Because only the active region is re-rendered (not the whole document), work stays bounded as the anchor advances.
+
+**Guarantee / caveat:** with healing off, the concatenation of all committed pushes plus `finish` is byte-identical to a one-shot `md_ansi`/`md_ansi_ex` render of the same input. The one theoretical exception is a CommonMark link reference definition appearing later in the stream, which can change how an earlier link rendered; such retroactive changes are not applied to already-committed output. Healing is a whole-document transform, so it is used only for `preview`/`finish`, not for committed output.
+
+The `md4x` CLI exposes this via `--format=ansi --stream` (see [CLI docs](../AGENTS.md)).
+
 ## Shared JSON Writer (`md4x-json.h`)
 
 Header-only utility providing JSON serialization and YAML-to-JSON conversion helpers. Used by both the AST and meta renderers.
