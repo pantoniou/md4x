@@ -103,8 +103,6 @@
 #define TBL_VERT            "\xe2\x94\x82"  /* │ U+2502 */
 #define TBL_HORIZ           "\xe2\x94\x80"  /* ─ U+2500 */
 #define TBL_CROSS           "\xe2\x94\xbc"  /* ┼ U+253C */
-#define TBL_ELLIPSIS        "\xe2\x80\xa6"  /* … U+2026 */
-#define TBL_MARGIN          2               /* document margin (cols, each side) */
 
 /* Blockquote bar (UTF-8: vertical bar U+2502) */
 #define QUOTE_BAR           "\xe2\x94\x82"
@@ -218,6 +216,8 @@ static void
 render_indent(MD_ANSI* r)
 {
     int i;
+    /* Global document left margin, applied to every line (like glow). */
+    RENDER_VERBATIM(r, "  ");
     for(i = 0; i < r->quote_depth; i++) {
         render_ansi(r, ANSI_DIM);
         RENDER_VERBATIM(r, "  " QUOTE_BAR " ");
@@ -866,54 +866,6 @@ ansi_indent_width(MD_ANSI* r)
     return w;
 }
 
-/* Emit one cell, aligned/padded or truncated with an ellipsis, to fit width. */
-static void
-table_emit_cell(MD_ANSI* r, const MD_ANSI_TCELL* cell, int width,
-                MD_ALIGN align, int is_header)
-{
-    int cw = (cell != NULL) ? ansi_disp_width(cell->buf, cell->size) : 0;
-
-    if(width <= 0)
-        return;
-
-    if(is_header)
-        render_ansi(r, ANSI_BOLD);
-
-    if(cw > width) {
-        MD_SIZE i = 0;
-        int emitted = 0;
-        while(cell != NULL && i < cell->size) {
-            MD_SIZE e = ansi_esc_len(cell->buf + i, cell->size - i);
-            unsigned cp;
-            MD_SIZE cl;
-            int w;
-            if(e > 0) { render_verbatim(r, cell->buf + i, e); i += e; continue; }
-            cl = ansi_utf8_decode(cell->buf + i, cell->size - i, &cp);
-            w = cp_width(cp);
-            if(emitted + w > width - 1)
-                break;
-            render_verbatim(r, cell->buf + i, cl);
-            emitted += w;
-            i += cl;
-        }
-        RENDER_VERBATIM(r, TBL_ELLIPSIS);
-        emitted += 1;
-        while(emitted < width) { RENDER_VERBATIM(r, " "); emitted++; }
-    } else {
-        int pad = width - cw;
-        int lpad = 0, rpad = pad;
-        if(align == MD_ALIGN_RIGHT) { lpad = pad; rpad = 0; }
-        else if(align == MD_ALIGN_CENTER) { lpad = pad / 2; rpad = pad - lpad; }
-        while(lpad-- > 0) RENDER_VERBATIM(r, " ");
-        if(cell != NULL && cell->size > 0)
-            render_verbatim(r, cell->buf, cell->size);
-        while(rpad-- > 0) RENDER_VERBATIM(r, " ");
-    }
-
-    if(is_header)
-        render_ansi(r, ANSI_BOLD_OFF);
-}
-
 static void
 tbl_spaces(MD_ANSI* r, int n)
 {
@@ -921,22 +873,147 @@ tbl_spaces(MD_ANSI* r, int n)
         RENDER_VERBATIM(r, " ");
 }
 
+/* One wrapped physical line within a cell: a byte slice and its display width. */
+typedef struct { MD_SIZE start; MD_SIZE len; int w; } TLINE;
+
+/* Greedy word-wrap of a cell's content to `width` display columns, like glow.
+ * Returns a malloc'd array of line slices into the cell buffer (count in
+ * *n_out); the caller frees it. ANSI escapes are zero-width and stay attached
+ * to the line they appear in. Always returns at least one (possibly empty)
+ * line. */
+static TLINE*
+table_wrap_cell(const MD_ANSI_TCELL* cell, int width, int* n_out)
+{
+    TLINE* lines = NULL;
+    int n = 0, cap = 0;
+    const char* buf = (cell != NULL) ? cell->buf : NULL;
+    MD_SIZE size = (cell != NULL) ? cell->size : 0;
+    MD_SIZE i = 0, line_start = 0, last_space = (MD_SIZE) -1;
+    int line_w = 0, w_at_space = 0;
+
+    if(width < 1)
+        width = 1;
+
+#define TLINE_PUSH(s, e, wd)                                                 \
+    do {                                                                     \
+        if(n >= cap) {                                                       \
+            int nc = cap ? cap * 2 : 4;                                      \
+            TLINE* p = (TLINE*) realloc(lines, (size_t) nc * sizeof(TLINE)); \
+            if(p == NULL) { *n_out = n; return lines; }                      \
+            lines = p; cap = nc;                                             \
+        }                                                                    \
+        lines[n].start = (s); lines[n].len = (MD_SIZE) ((e) - (s));          \
+        lines[n].w = (wd); n++;                                              \
+    } while(0)
+
+    while(i < size) {
+        MD_SIZE e = ansi_esc_len(buf + i, size - i);
+        unsigned cp;
+        MD_SIZE cl;
+        int cw;
+
+        if(e > 0) { i += e; continue; }     /* escape stays on the current line */
+
+        cl = ansi_utf8_decode(buf + i, size - i, &cp);
+        cw = cp_width(cp);
+
+        if(cp == ' ') {
+            last_space = i;
+            w_at_space = line_w;
+        }
+
+        if(line_w + cw > width && i > line_start) {
+            if(last_space != (MD_SIZE) -1 && last_space > line_start) {
+                TLINE_PUSH(line_start, last_space, w_at_space);
+                i = last_space;
+                while(i < size && buf[i] == ' ') i++;   /* skip the break spaces */
+                line_start = i;
+                line_w = 0;
+                last_space = (MD_SIZE) -1;
+                continue;
+            } else {
+                TLINE_PUSH(line_start, i, line_w);       /* hard break long word */
+                line_start = i;
+                line_w = 0;
+                last_space = (MD_SIZE) -1;
+            }
+        }
+        line_w += cw;
+        i += cl;
+    }
+
+    /* Final line, with trailing spaces trimmed. */
+    {
+        MD_SIZE e = size;
+        int tw = line_w;
+        while(e > line_start && buf[e - 1] == ' ') { e--; tw--; }
+        if(e > line_start || n == 0)
+            TLINE_PUSH(line_start, e, tw < 0 ? 0 : tw);
+    }
+#undef TLINE_PUSH
+
+    *n_out = n;
+    return lines;
+}
+
+/* Emit one wrapped line of a cell, aligned and padded to `width`. */
+static void
+table_emit_slice(MD_ANSI* r, const char* buf, TLINE ln, int width,
+                 MD_ALIGN align, int is_header)
+{
+    int pad = width - ln.w;
+    int lpad = 0, rpad;
+    if(pad < 0) pad = 0;
+    rpad = pad;
+    if(align == MD_ALIGN_RIGHT)       { lpad = pad; rpad = 0; }
+    else if(align == MD_ALIGN_CENTER) { lpad = pad / 2; rpad = pad - lpad; }
+
+    tbl_spaces(r, lpad);
+    if(is_header) render_ansi(r, ANSI_BOLD);
+    if(ln.len > 0) render_verbatim(r, buf + ln.start, ln.len);
+    if(is_header) render_ansi(r, ANSI_BOLD_OFF);
+    tbl_spaces(r, rpad);
+}
+
 static void
 table_emit_row(MD_ANSI* r, MD_ANSI_TROW* row, const int* widths, int n_cols)
 {
-    int j;
-    render_indent(r);
-    tbl_spaces(r, TBL_MARGIN);
-    RENDER_VERBATIM(r, " ");                 /* outer left cell padding */
+    TLINE** wrapped = (TLINE**) calloc((size_t) n_cols, sizeof(TLINE*));
+    int* nlines = (int*) calloc((size_t) n_cols, sizeof(int));
+    const char** bufs = (const char**) calloc((size_t) n_cols, sizeof(char*));
+    int height = 1, j, k;
+
+    if(wrapped == NULL || nlines == NULL || bufs == NULL) {
+        free(wrapped); free(nlines); free((void*) bufs);
+        return;
+    }
+
     for(j = 0; j < n_cols; j++) {
         const MD_ANSI_TCELL* cell = (j < row->n_cells) ? &row->cells[j] : NULL;
-        MD_ALIGN align = (j < r->table->n_aligns) ? r->table->aligns[j] : MD_ALIGN_DEFAULT;
-        if(j > 0)
-            RENDER_VERBATIM(r, " " TBL_VERT " ");
-        table_emit_cell(r, cell, widths[j], align, row->is_header);
+        bufs[j] = (cell != NULL) ? cell->buf : NULL;
+        wrapped[j] = table_wrap_cell(cell, widths[j], &nlines[j]);
+        if(nlines[j] > height) height = nlines[j];
     }
-    RENDER_VERBATIM(r, " ");                 /* outer right cell padding */
-    render_newline(r);
+
+    for(k = 0; k < height; k++) {
+        render_indent(r);
+        RENDER_VERBATIM(r, " ");                 /* outer left cell padding */
+        for(j = 0; j < n_cols; j++) {
+            MD_ALIGN align = (j < r->table->n_aligns) ? r->table->aligns[j] : MD_ALIGN_DEFAULT;
+            if(j > 0)
+                RENDER_VERBATIM(r, " " TBL_VERT " ");
+            if(k < nlines[j])
+                table_emit_slice(r, bufs[j], wrapped[j][k], widths[j], align, row->is_header);
+            else
+                tbl_spaces(r, widths[j]);
+        }
+        RENDER_VERBATIM(r, " ");                 /* outer right cell padding */
+        render_newline(r);
+    }
+
+    for(j = 0; j < n_cols; j++)
+        free(wrapped[j]);
+    free(wrapped); free(nlines); free((void*) bufs);
 }
 
 static void
@@ -944,7 +1021,6 @@ table_emit_separator(MD_ANSI* r, const int* widths, int n_cols)
 {
     int j, k;
     render_indent(r);
-    tbl_spaces(r, TBL_MARGIN);
     RENDER_VERBATIM(r, TBL_HORIZ);           /* under outer left padding */
     for(j = 0; j < n_cols; j++) {
         if(j > 0)
@@ -997,9 +1073,12 @@ table_emit(MD_ANSI* r)
      * INF(0) = unlimited (natural widths), <0 = auto-detect. */
     indent_w = ansi_indent_width(r);
 
+    /* The document margin and any blockquote/list chrome are already part of
+     * indent_w (emitted by render_indent), so the only extra per-line overhead
+     * here is the two outer cell paddings plus the " │ " gaps. */
     if(r->table_width != MD_ANSI_WIDTH_INF) {
         int wtarget = (r->table_width > 0) ? r->table_width : table_term_width();
-        int overhead = TBL_MARGIN + 2 + 3 * (n_cols - 1);
+        int overhead = 2 + 3 * (n_cols - 1);
         int content_avail = wtarget - indent_w - overhead;
         if(content_avail < n_cols) content_avail = n_cols;  /* >= 1 col each */
 
